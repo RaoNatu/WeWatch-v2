@@ -22,7 +22,7 @@ let closeFallbackTimer;
 let overlayWindow;
 let overlayReady = false;
 let pendingOverlay = [];
-let overlayConfig = { enabled: true, position: 'top-right', customX: 78, customY: 8, duration: 2000 };
+let overlayConfig = { enabled: true, position: 'top-right', customX: 78, customY: 8, duration: 2000, types: { playback: true, roomActivity: true, chat: true, reactions: true } };
 
 const OVERLAY_WIDTH = 430;
 const OVERLAY_CARD_HEIGHT = 82;
@@ -38,6 +38,12 @@ function normalizedOverlayConfig(value = {}) {
     customX: Math.max(0, Math.min(100, Number(value.customX) || 0)),
     customY: Math.max(0, Math.min(100, Number(value.customY) || 0)),
     duration: Math.max(1000, Math.min(6000, Number(value.duration) || 2000)),
+    types: {
+      playback: value.types?.playback !== false,
+      roomActivity: value.types?.roomActivity !== false,
+      chat: value.types?.chat !== false,
+      reactions: value.types?.reactions !== false,
+    },
   };
 }
 
@@ -122,9 +128,13 @@ function createOverlayWindow() {
 
 async function showPlaybackOverlay(payload = {}) {
   if (!overlayConfig.enabled) return;
+  const action = ['play', 'pause', 'seek', 'join', 'leave', 'movie', 'chat', 'reaction'].includes(payload.action) ? payload.action : 'pause';
+  const type = ['play', 'pause', 'seek', 'movie'].includes(action) ? 'playback'
+    : ['join', 'leave'].includes(action) ? 'roomActivity'
+      : action === 'chat' ? 'chat' : 'reactions';
+  if (!overlayConfig.types[type]) return;
   createOverlayWindow();
   await positionOverlay();
-  const action = ['play', 'pause', 'seek', 'join', 'leave', 'movie', 'chat', 'reaction'].includes(payload.action) ? payload.action : 'pause';
   const notification = {
     name: String(payload.name || 'A viewer').slice(0, 32),
     action,
@@ -199,6 +209,15 @@ function createWindow() {
       nodeIntegration: false,
       sandbox: true,
     },
+  });
+  win.webContents.on('before-input-event', (event, input) => {
+    if (input.type !== 'keyDown' || !input.control || input.alt || input.meta) return;
+    const zoomIn = input.key === '+' || input.key === '=' || input.code === 'NumpadAdd';
+    const zoomOut = input.key === '-' || input.code === 'Minus' || input.code === 'NumpadSubtract';
+    if (!zoomIn && !zoomOut) return;
+    event.preventDefault();
+    const nextLevel = win.webContents.getZoomLevel() + (zoomIn ? 0.5 : -0.5);
+    win.webContents.setZoomLevel(Math.max(-5, Math.min(5, nextLevel)));
   });
   win.on('close', (event) => {
     if (allowWindowClose) return;

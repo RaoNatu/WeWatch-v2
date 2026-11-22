@@ -17,9 +17,18 @@ const readActivity = () => {
   try { return JSON.parse(localStorage.getItem('wewatch-activity') || '[]').slice(0, 80); }
   catch { return []; }
 };
+const readWatchHistory = () => {
+  try {
+    const history = JSON.parse(localStorage.getItem('wewatch-history') || '[]');
+    return Array.isArray(history)
+      ? history.filter((entry) => entry?.title && Number.isFinite(entry.playedAt)).slice(0, 1)
+        .map((entry) => ({ ...entry, position: Math.max(0, Number(entry.position) || 0) }))
+      : [];
+  } catch { return []; }
+};
 const roomRef = (code) => doc(db, 'rooms', code);
 const memberRef = (code, uid) => doc(db, 'rooms', code, 'members', uid);
-const defaultPreferences = { accent: '#bc4b32', fontScale: 1.2, layout: 'comfortable', overlay: { enabled: true, position: 'top-right', customX: 78, customY: 8, duration: 2000 } };
+const defaultPreferences = { accent: '#bc4b32', fontScale: 1.2, layout: 'comfortable', overlay: { enabled: true, position: 'top-right', customX: 78, customY: 8, duration: 2000, types: { playback: true, roomActivity: true, chat: true, reactions: true } } };
 const movieGreeting = (hour = new Date().getHours()) => {
   if (hour >= 5 && hour < 12) return 'Movie Morning';
   if (hour < 17) return 'Movie Day';
@@ -33,7 +42,7 @@ const readPreferences = () => {
     if (Number(saved.fontScale) === 1.05) saved.fontScale = 1.2;
     // Replace the previous lime default with the new cinema-paper theme's brick accent.
     if (saved.accent?.toLowerCase() === '#d4f37b') saved.accent = '#bc4b32';
-    return { ...defaultPreferences, ...saved, overlay: { ...defaultPreferences.overlay, ...saved.overlay } };
+    return { ...defaultPreferences, ...saved, overlay: { ...defaultPreferences.overlay, ...saved.overlay, types: { ...defaultPreferences.overlay.types, ...saved.overlay?.types } } };
   } catch { return defaultPreferences; }
 };
 
@@ -46,7 +55,7 @@ async function createRoom(uid, name, initialPlayback) {
         const current = await tx.get(ref);
         if (current.exists()) throw new Error('ROOM_COLLISION');
         const playback = { position: initialPlayback?.time || 0, duration: initialPlayback?.length || 0, movie: initialPlayback?.information?.category?.meta?.title || '', paused: true, updatedBy: uid, updatedAt: serverTimestamp() };
-        tx.set(ref, { hostUid: uid, memberUids: [uid], memberCount: 1, playbackControlsEnabled: true, driftCorrection: { enabled: false, threshold: 2.5 }, createdAt: serverTimestamp(), playback });
+        tx.set(ref, { hostUid: uid, memberUids: [uid], memberCount: 1, locked: false, playbackControlsEnabled: true, driftCorrection: { enabled: false, threshold: 2.5 }, createdAt: serverTimestamp(), playback });
         tx.set(memberRef(code, uid), { uid, name, joinedAt: serverTimestamp(), playback });
       });
       return code;
@@ -62,6 +71,7 @@ async function joinRoom(uid, name, code) {
     if (!room.exists()) throw new Error('No room found with that code.');
     const data = room.data();
     if ((data.memberUids || []).includes(uid)) return { position: data.playback?.position || 0, didJoin: false };
+    if (data.locked === true) throw new Error('The host has locked this room. Ask them to unlock it before you join.');
     if ((data.memberUids || []).length >= 6) throw new Error('This room is full. Rooms can have up to six people.');
     const hostPlayback = data.playback || { position: 0, duration: 0, movie: '' };
     const joinPosition = hostPlayback.position || 0;
@@ -117,9 +127,13 @@ function App() {
   const [localPlayback, setLocalPlayback] = useState(null);
   const [mediaName, setMediaName] = useState('No movie selected');
   const [busy, setBusy] = useState('');
+  const [hostTransferBusy, setHostTransferBusy] = useState(false);
+  const [removingMemberUid, setRemovingMemberUid] = useState('');
   const [error, setError] = useState('');
   const [toast, setToast] = useState('');
   const [events, setEvents] = useState(readActivity);
+  const [watchHistory, setWatchHistory] = useState(readWatchHistory);
+  const lastHistoryTitleRef = useRef(readWatchHistory()[0]?.title || '');
   const roomStateRef = useRef(null);
   const memberSnapshotRef = useRef([]);
   const memberNameCacheRef = useRef(new Map());
@@ -128,6 +142,7 @@ function App() {
   const applyingRemote = useRef(false);
   const lastAppliedCommandRef = useRef('');
   const lastAnnouncedCommandRef = useRef('');
+  const lastHostUidRef = useRef('');
   const initialCommandRoomRef = useRef('');
   const initializedPlaybackRoomRef = useRef('');
   const playbackRefreshRequestRef = useRef(0);
@@ -155,6 +170,36 @@ function App() {
     setEvents((current) => [entry, ...current].slice(0, 80));
   }, []);
 
+  const persistWatchHistory = useCallback((next) => {
+    localStorage.setItem('wewatch-history', JSON.stringify(next));
+    setWatchHistory(next);
+  }, []);
+
+  const recordWatchHistory = useCallback((title, playedAt = Date.now(), position = 0) => {
+    const cleanTitle = String(title || '').trim();
+    if (!cleanTitle) return;
+    const current = readWatchHistory();
+    const latest = current[0];
+    const isSamePlayback = latest && playedAt >= latest.playedAt && playedAt - latest.playedAt < 15000
+      && lastHistoryTitleRef.current === latest.title;
+    const next = isSamePlayback
+      ? [{ ...latest, title: cleanTitle, position: Math.max(0, Number(position) || 0) }]
+      : [{ title: cleanTitle, playedAt, position: Math.max(0, Number(position) || 0) }];
+    lastHistoryTitleRef.current = cleanTitle;
+    persistWatchHistory(next);
+  }, [persistWatchHistory]);
+
+  const saveWatchHistoryPosition = useCallback((title, position, force = false) => {
+    const cleanTitle = String(title || '').trim();
+    if (!cleanTitle) return;
+    const current = readWatchHistory();
+    const latest = current[0];
+    if (!latest || latest.title !== cleanTitle) return;
+    const nextPosition = Math.max(0, Number(position) || 0);
+    if (!force && Math.abs(nextPosition - latest.position) < 5) return;
+    persistWatchHistory([{ ...latest, position: nextPosition }]);
+  }, [persistWatchHistory]);
+
   useEffect(() => {
     localStorage.setItem('wewatch-preferences', JSON.stringify(preferences));
     document.documentElement.style.setProperty('--lime', preferences.accent);
@@ -166,6 +211,24 @@ function App() {
   useEffect(() => {
     localStorage.setItem('wewatch-activity', JSON.stringify(events));
   }, [events]);
+
+  useEffect(() => {
+    localStorage.setItem('wewatch-history', JSON.stringify(watchHistory));
+  }, [watchHistory]);
+
+  useEffect(() => {
+    if (!vlc.managed || !localPlayback || localPlayback.state === 'stopped') {
+      if (!vlc.managed && localPlayback) saveWatchHistoryPosition(mediaName, localPlayback.time, true);
+      lastHistoryTitleRef.current = '';
+      return;
+    }
+    const actualTitle = String(localPlayback.information?.category?.meta?.title || '').trim();
+    const title = actualTitle || mediaName;
+    if (!title || title === 'No movie selected') return;
+    if (actualTitle && actualTitle !== mediaName) setMediaName(actualTitle);
+    if (title !== lastHistoryTitleRef.current) recordWatchHistory(title, Date.now(), localPlayback.time);
+    else saveWatchHistoryPosition(title, localPlayback.time);
+  }, [vlc.managed, localPlayback?.state, localPlayback?.time, localPlayback?.information?.category?.meta?.title, mediaName, recordWatchHistory, saveWatchHistoryPosition]);
 
   useEffect(() => {
     if (sessionLoggedRef.current) return;
@@ -224,6 +287,21 @@ function App() {
       }
       const nextRoom = snapshot.data();
       const previousRoom = roomStateRef.current;
+      if (previousRoom?.memberUids?.includes(uid) && !nextRoom.memberUids?.includes(uid)) {
+        roomStateRef.current = nextRoom;
+        setRoom(nextRoom);
+        setMembers([]);
+        setMessages([]);
+        logEvent('Removed from room', name || 'You', 'The host removed you from the room', 'warning');
+        setToast('You were removed from the room');
+        setTimeout(() => setToast(''), 2400);
+        setCode('');
+        return;
+      }
+      if (previousRoom?.hostUid && previousRoom.hostUid !== nextRoom.hostUid && nextRoom.hostUid === uid) {
+        setToast('You are now the host');
+        setTimeout(() => setToast(''), 2200);
+      }
       if (previousRoom && previousRoom.memberUids && nextRoom.memberUids) {
         const removed = previousRoom.memberUids.filter((memberUid) => !nextRoom.memberUids.includes(memberUid) && memberUid !== uid);
         removed.forEach((memberUid) => {
@@ -263,7 +341,7 @@ function App() {
       setMessages(snapshot.docs.map((message) => ({ id: message.id, ...message.data() })));
     }, (e) => setError(`Room chat connection issue: ${e.message}`));
     return () => { stopRoom(); stopMembers(); stopMessages(); };
-  }, [code, uid, logEvent]);
+  }, [code, uid, name, logEvent]);
 
   const sendRoomMessage = async (type, value) => {
     if (!code || !uid) return false;
@@ -342,6 +420,7 @@ function App() {
     initializedPlaybackRoomRef.current = '';
     lastAppliedCommandRef.current = '';
     lastAnnouncedCommandRef.current = '';
+    lastHostUidRef.current = '';
     initialCommandRoomRef.current = '';
     lastLocalSampleRef.current = null;
   }, [code]);
@@ -355,7 +434,9 @@ function App() {
 
   useEffect(() => {
     if (!remotePlayback || !code || !uid || remotePlayback.updatedBy === uid || !vlc.managed || applyingRemote.current) return;
-    const initialRoomSync = initializedPlaybackRoomRef.current !== code;
+    const hostChanged = Boolean(lastHostUidRef.current && lastHostUidRef.current !== room?.hostUid);
+    if (room?.hostUid) lastHostUidRef.current = room.hostUid;
+    const initialRoomSync = initializedPlaybackRoomRef.current !== code || hostChanged;
     initializedPlaybackRoomRef.current = code;
     const autoDriftCorrection = room?.driftCorrection?.enabled === true;
     const followHost = initialRoomSync || !room?.playbackControlsEnabled || autoDriftCorrection;
@@ -376,7 +457,7 @@ function App() {
       setTimeout(() => { applyingRemote.current = false; }, 1500);
     };
     apply();
-  }, [code, room?.playbackControlsEnabled, room?.driftCorrection?.enabled, driftThreshold, remotePlayback?.position, remotePlayback?.paused, remotePlayback?.updatedBy, localPlayback?.time, localPlayback?.state, vlc.managed, uid]);
+  }, [code, room?.hostUid, room?.playbackControlsEnabled, room?.driftCorrection?.enabled, driftThreshold, remotePlayback?.position, remotePlayback?.paused, remotePlayback?.updatedBy, localPlayback?.time, localPlayback?.state, vlc.managed, uid]);
 
   useEffect(() => {
     const command = room?.playbackCommand;
@@ -526,7 +607,7 @@ function App() {
   const driftLabel = drift === null ? 'Waiting for their player' : Math.abs(drift) <= 2.5 ? 'In sync' : `${isHost ? 'Guest' : 'Host'} ${fmt(Math.abs(drift))} ${drift > 0 ? 'behind' : 'ahead'}`;
   const copyCode = async () => { await navigator.clipboard.writeText(code); logEvent('Invite copied', name || 'You', `Room ${code}`); setToast('Room code copied'); setTimeout(() => setToast(''), 1800); };
   const startVlc = async () => { setError(''); try { await window.desktop.startVlc(); logEvent('VLC started', name || 'You', 'Started the managed player'); refreshVlc(); } catch (e) { setError(e.message); } };
-  const chooseMovie = async () => { setError(''); try { const picked = await window.desktop.chooseMovie(); if (picked) { setMediaName(picked.name); logEvent('Movie selected', name || 'You', picked.name); window.desktop.showPlaybackOverlay?.({ name: name || 'You', action: 'movie', fileName: picked.name, position: localPlayback?.time || 0 }); if (code) await updateDoc(roomRef(code), { playbackCommand: { id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, action: 'movie', by: uid, name: name || 'You', fileName: picked.name, position: localPlayback?.time || 0, createdAt: serverTimestamp() } }); refreshVlc(); } } catch (e) { setError(e.message); } };
+  const chooseMovie = async () => { setError(''); try { const picked = await window.desktop.chooseMovie(); if (picked) { const playedAt = Date.now(); setMediaName(picked.name); recordWatchHistory(picked.name, playedAt, 0); logEvent('Movie selected', name || 'You', picked.name); window.desktop.showPlaybackOverlay?.({ name: name || 'You', action: 'movie', fileName: picked.name, position: localPlayback?.time || 0 }); if (code) await updateDoc(roomRef(code), { playbackCommand: { id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, action: 'movie', by: uid, name: name || 'You', fileName: picked.name, position: localPlayback?.time || 0, createdAt: serverTimestamp() } }); refreshVlc(); } } catch (e) { setError(e.message); } };
   const togglePlayback = async () => {
     if (!window.desktop || playbackActionBusyRef.current || (!isHost && code && !room?.playbackControlsEnabled)) return;
     playbackActionBusyRef.current = true;
@@ -600,6 +681,16 @@ function App() {
     }
     catch (e) { setError(e.message); }
   };
+  const toggleRoomLock = async () => {
+    if (!isHost || !code) return;
+    const locked = room?.locked !== true;
+    try {
+      await updateDoc(roomRef(code), { locked });
+      logEvent(locked ? 'Room locked' : 'Room unlocked', name || 'You', locked ? 'New members can no longer join' : 'The room is open to new members');
+      setToast(locked ? 'Room locked' : 'Room unlocked');
+      setTimeout(() => setToast(''), 2200);
+    } catch (e) { setError(`Couldn't ${locked ? 'lock' : 'unlock'} the room: ${e.message}`); }
+  };
   const toggleDriftCorrection = async () => {
     if (!isHost || !code) return;
     const enabled = room?.driftCorrection?.enabled !== true;
@@ -618,6 +709,47 @@ function App() {
       setDriftThresholdDraft(String(threshold));
       logEvent('Drift threshold changed', name || 'You', `Correction starts at ${threshold}s of drift`);
     } catch (e) { setError(`Couldn't save drift threshold: ${e.message}`); }
+  };
+  const transferHost = async (targetUid) => {
+    if (!isHost || !code || targetUid === uid || hostTransferBusy || removingMemberUid) return;
+    const target = members.find((member) => member.uid === targetUid);
+    if (!target) return;
+    setHostTransferBusy(true);
+    try {
+      await updateDoc(roomRef(code), { hostUid: targetUid });
+      logEvent('Host transferred', name || 'You', `Transferred room host to ${target.name || 'a member'}`);
+      setToast(`${target.name || 'Member'} is now the host`); setTimeout(() => setToast(''), 2200);
+    } catch (e) { setError(`Couldn't transfer host: ${e.message}`); }
+    finally { setHostTransferBusy(false); }
+  };
+  const removeMember = async (targetUid) => {
+    if (!isHost || !code || targetUid === uid || removingMemberUid || hostTransferBusy) return;
+    const target = members.find((member) => member.uid === targetUid);
+    if (!target) return;
+    const targetName = target.name || 'this member';
+    if (!window.confirm(`Remove ${targetName} from this room? They can join again with the room code.`)) return;
+    setRemovingMemberUid(targetUid);
+    try {
+      await runTransaction(db, async (transaction) => {
+        const ref = roomRef(code);
+        const currentRoom = await transaction.get(ref);
+        if (!currentRoom.exists()) throw new Error('This room has already ended.');
+        const data = currentRoom.data();
+        if (data.hostUid !== uid) throw new Error('Only the current host can remove a member.');
+        if (targetUid === data.hostUid) throw new Error('The host cannot remove themselves.');
+        const memberUids = data.memberUids || [];
+        if (!memberUids.includes(targetUid)) throw new Error('This member is no longer in the room.');
+        const targetRef = memberRef(code, targetUid);
+        const targetDocument = await transaction.get(targetRef);
+        const remainingUids = memberUids.filter((memberUid) => memberUid !== targetUid);
+        transaction.update(ref, { memberUids: remainingUids, memberCount: remainingUids.length });
+        if (targetDocument.exists()) transaction.delete(targetRef);
+      });
+      logEvent('Member removed', name || 'You', `Removed ${targetName} from the room`, 'warning');
+      setToast(`${targetName} was removed from the room`);
+      setTimeout(() => setToast(''), 2200);
+    } catch (e) { setError(`Couldn't remove ${targetName}: ${e.message}`); }
+    finally { setRemovingMemberUid(''); }
   };
   const clearActivity = () => setEvents([]);
   const saveSettings = (next) => setPreferences((current) => ({ ...current, ...next }));
@@ -650,7 +782,7 @@ function App() {
             <button className="secondary-btn" disabled={Boolean(busy) || codeInput.length !== 6} onClick={() => runRoomAction('join', codeInput)}><span>{busy === 'join' ? 'Finding your room…' : 'Join the room'}</span>{busy === 'join' ? <LoaderCircle className="spin" size={19} /> : <ArrowUpRight size={19} />}</button>
             <div className="secure-note"><ShieldCheck size={17} /> Your invite is your key</div>
           </article>
-        </div> : <RoomView code={code} uid={uid} members={members} messages={messages} onSendRoomMessage={sendRoomMessage} peer={peer} name={name} room={room} isHost={isHost} peerPlayback={peerPlayback} pingMs={room?.ping?.ms} driftLabel={driftLabel} driftThreshold={driftThreshold} driftThresholdDraft={driftThresholdDraft} onDriftThresholdChange={setDriftThresholdDraft} onSaveDriftThreshold={saveDriftThreshold} onToggleDriftCorrection={toggleDriftCorrection} copyCode={copyCode} onLeave={leaveRoom} leaving={busy === 'leave'} onToggleControls={toggleMemberControls} onSyncHost={syncWithHost} onSyncMembers={syncMembersToHost} />}
+        </div> : <RoomView code={code} uid={uid} members={members} messages={messages} onSendRoomMessage={sendRoomMessage} peer={peer} name={name} room={room} isHost={isHost} hostTransferBusy={hostTransferBusy} removingMemberUid={removingMemberUid} onTransferHost={transferHost} onRemoveMember={removeMember} peerPlayback={peerPlayback} pingMs={room?.ping?.ms} driftLabel={driftLabel} driftThreshold={driftThreshold} driftThresholdDraft={driftThresholdDraft} onDriftThresholdChange={setDriftThresholdDraft} onSaveDriftThreshold={saveDriftThreshold} onToggleDriftCorrection={toggleDriftCorrection} onToggleRoomLock={toggleRoomLock} copyCode={copyCode} onLeave={leaveRoom} leaving={busy === 'leave'} onToggleControls={toggleMemberControls} onSyncHost={syncWithHost} onSyncMembers={syncMembersToHost} />}
 
         <section className="setup-section">
           <div className="section-title"><div><span className="section-kicker">THE PROJECTOR BOOTH</span><h2>Your local player</h2></div><div className={`vlc-pill ${vlc.managed ? 'connected' : vlc.installed ? 'available' : 'missing'}`}><span />{statusLabel}</div></div>
@@ -664,19 +796,20 @@ function App() {
       </section>
       <aside className="side-rail activity-rail">
         <div className="activity-header"><span className="section-kicker">LOCAL DEBUG HISTORY</span><div className="activity-title-row"><div><h2>Activity log</h2><p>Playback, room events, and errors</p></div><button className="activity-clear" onClick={clearActivity} disabled={!events.length}>Clear</button></div><div className="activity-summary"><span><i /> Captured on this device</span><b>{events.length} / 80</b></div></div>
+        <section className="watch-history" aria-label="Recently played"><div className="watch-history-heading"><span className="section-kicker">RECENTLY PLAYED</span></div>{watchHistory.length ? <ul>{watchHistory.slice(0, 1).map((entry) => <li key={entry.playedAt}><b title={entry.title}>{entry.title}</b><time title="Last playback position">{clockFmt(entry.position)}</time></li>)}</ul> : <p>Movies you select will appear here with their last playback position.</p>}</section>
         <div className="activity-list" aria-live="polite">
           {!events.length && <div className="activity-empty"><Activity size={22} /><b>No events yet</b><span>App actions will appear here with their time and user.</span></div>}
           {events.map((entry) => <article className={`activity-entry ${entry.severity || 'info'}`} key={entry.id}><time dateTime={new Date(entry.at).toISOString()}>{wallClockFmt(entry.at)}</time><span className="activity-marker" /><div className="activity-entry-copy"><div><b>{entry.actor}</b><strong>{entry.event}</strong></div>{entry.detail && <p>{entry.detail}</p>}</div></article>)}
         </div>
       </aside>
     </div>
-    <div className="window-footer"><span><Activity size={15} /> {authReady ? 'Connected to the watch club' : 'Connecting to the watch club'}</span><span>WE WATCH DESKTOP <i>·</i> 0.1.0</span></div>
+    <div className="window-footer"><span><Activity size={15} /> {authReady ? 'Connected to the watch club' : 'Connecting to the watch club'}</span><span>WE WATCH DESKTOP <i>·</i> 0.1.0 <i>·</i> Made with ❤️ by Natu</span></div>
     {settingsOpen && <SettingsPanel name={name} preferences={preferences} onNameChange={setName} onChange={saveSettings} onClose={async () => { localStorage.setItem('wewatch-name', name.trim()); if (code && uid) updateDoc(memberRef(code, uid), { name: name.trim() }).catch(() => {}); setSettingsOpen(false); }} />}
     {toast && <div className="toast"><Check size={18} />{toast}</div>}
   </main>;
 }
 
-function RoomView({ code, uid, members, messages, onSendRoomMessage, peer, name, room, isHost, peerPlayback, pingMs, driftLabel, driftThreshold, driftThresholdDraft, onDriftThresholdChange, onSaveDriftThreshold, onToggleDriftCorrection, copyCode, onLeave, leaving, onToggleControls, onSyncHost, onSyncMembers }) {
+function RoomView({ code, uid, members, messages, onSendRoomMessage, peer, name, room, isHost, hostTransferBusy, removingMemberUid, onTransferHost, onRemoveMember, peerPlayback, pingMs, driftLabel, driftThreshold, driftThresholdDraft, onDriftThresholdChange, onSaveDriftThreshold, onToggleDriftCorrection, onToggleRoomLock, copyCode, onLeave, leaving, onToggleControls, onSyncHost, onSyncMembers }) {
   const [chatDraft, setChatDraft] = useState('');
   const [chatSending, setChatSending] = useState(false);
   const chatListRef = useRef(null);
@@ -706,10 +839,11 @@ function RoomView({ code, uid, members, messages, onSendRoomMessage, peer, name,
   }, [messages]);
   return <section className="active-room panel"><div className="room-live"><div><div className="section-kicker">YOUR PRIVATE ROOM · {members.length || 1}/6 WATCHING</div><h2>You're in. <em>Invite your people.</em></h2></div><button className="leave-btn" disabled={leaving} onClick={onLeave}><X size={18} /> {leaving ? (isHost ? 'Closing room…' : 'Leaving room…') : (isHost ? 'Close room for everyone' : 'Leave room')}</button></div><div className="room-invite"><div><span>SHARE THIS SIX-DIGIT ROOM CODE</span><strong>{code.slice(0, 3)} <b>{code.slice(3)}</b></strong></div><button className="copy-btn" onClick={copyCode}><Copy size={18} /> Copy invite code</button></div>
     <div className="current-user-banner"><span className="avatar current-user-avatar">{name.trim().slice(0, 1).toUpperCase() || 'Y'}</span><div><small>YOU'RE WATCHING AS</small><b>{name || 'Your profile'}</b></div><span className="current-user-role">{isHost ? 'HOST' : 'MEMBER'} · YOU</span></div>
-    <div className="room-members">{participants.map((member) => { const isCurrentUser = member.uid === uid; const memberIsHost = member.uid === room?.hostUid; return <div className={`room-member ${isCurrentUser ? 'current-user-row' : ''}`} key={member.uid}><span className={`avatar ${isCurrentUser ? '' : 'friend'}`}>{member.name?.slice(0, 1).toUpperCase() || '＋'}</span><div><b>{member.name || (isCurrentUser ? 'You' : 'Guest')}</b><small>{memberIsHost ? 'HOST' : 'MEMBER'}{isCurrentUser ? ' · YOU' : ''}{member.playback?.paused === false ? ' · PLAYING' : ''}</small><small className="member-title"><Film size={11} /> {member.playback?.movie || 'Movie not selected'}</small><small className="member-movie">{formatPosition(member.playback)}</small></div><span className="member-ready"><Check size={12} /> {isCurrentUser ? 'YOU' : 'HERE'}</span></div>; })}</div>
+    <div className="room-members">{participants.map((member) => { const isCurrentUser = member.uid === uid; const memberIsHost = member.uid === room?.hostUid; const hostActionBusy = hostTransferBusy || Boolean(removingMemberUid); return <div className={`room-member ${isCurrentUser ? 'current-user-row' : ''}`} key={member.uid}><span className={`avatar ${isCurrentUser ? '' : 'friend'}`}>{member.name?.slice(0, 1).toUpperCase() || '＋'}</span><div><b>{member.name || (isCurrentUser ? 'You' : 'Guest')}</b><small>{memberIsHost ? 'HOST' : 'MEMBER'}{isCurrentUser ? ' · YOU' : ''}{member.playback?.paused === false ? ' · PLAYING' : ''}</small><small className="member-title"><Film size={11} /> {member.playback?.movie || 'Movie not selected'}</small><small className="member-movie">{formatPosition(member.playback)}</small></div>{isHost && !isCurrentUser ? <div className="member-host-actions"><button className="make-host-btn" disabled={hostActionBusy} onClick={() => onTransferHost(member.uid)} title={`Transfer host to ${member.name || 'this member'}`}>Make host</button><button className="remove-member-btn" disabled={hostActionBusy} onClick={() => onRemoveMember(member.uid)} aria-label={`Remove ${member.name || 'member'} from the room`} title={`Remove ${member.name || 'this member'} from the room`}><X size={14} /> Remove</button></div> : <span className="member-ready"><Check size={12} /> {isCurrentUser ? 'YOU' : 'HERE'}</span>}</div>; })}</div>
     <div className="room-controls">
       <div className="room-control-info"><span className="ping-tag"><Gauge size={14} /> {pingMs ? `${pingMs} ms relay ping` : 'Measuring room ping…'}</span><span className={`drift-tag ${driftLabel === 'In sync' ? 'good' : ''}`}>{driftLabel}</span></div>
       {isHost ? <div className="room-host-controls">
+        <div className="room-setting-row"><div className="room-setting-copy"><b>Lock room</b><small>{room?.locked ? 'New members cannot join with the room code.' : 'Allow people with the room code to join.'}</small></div><button className={`control-toggle ${room?.locked ? 'enabled' : ''}`} aria-pressed={room?.locked === true} onClick={onToggleRoomLock}><span className="toggle-switch"><i /></span> <b>{room?.locked ? 'LOCKED' : 'OPEN'}</b></button></div>
         <div className="room-setting-row"><div className="room-setting-copy"><b>Automatic drift correction</b><small>Follow your playback when a member drifts past the chosen threshold.</small></div><button className={`control-toggle ${room?.driftCorrection?.enabled ? 'enabled' : ''}`} aria-pressed={room?.driftCorrection?.enabled === true} onClick={onToggleDriftCorrection}><span className="toggle-switch"><i /></span> <b>{room?.driftCorrection?.enabled ? 'ON' : 'OFF'}</b></button></div>
         {room?.driftCorrection?.enabled && <div className="room-setting-row"><label className="room-setting-copy" htmlFor="drift-threshold"><b>Correction threshold</b><small>Members are corrected once drift exceeds this value.</small></label><div className="threshold-input"><input id="drift-threshold" type="number" min="2.5" max="15" step="0.5" value={driftThresholdDraft} onChange={(event) => onDriftThresholdChange(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') onSaveDriftThreshold(); }} aria-label="Automatic drift correction threshold in seconds" /><span>sec</span><button className="threshold-save" disabled={!thresholdDirty || !Number.isFinite(Number(driftThresholdDraft))} onClick={onSaveDriftThreshold}>Save</button></div></div>}
         <div className="room-host-actions"><button className="sync-host-btn" onClick={onSyncMembers}><RefreshCw size={15} /> Sync members to host</button><button className={`control-toggle ${room?.playbackControlsEnabled ? 'enabled' : ''}`} onClick={onToggleControls}><span className="toggle-switch"><i /></span> Member playback controls <b>{room?.playbackControlsEnabled ? 'ON' : 'OFF'}</b></button></div>
@@ -732,9 +866,17 @@ function SettingsPanel({ name, preferences, onNameChange, onChange, onClose }) {
     <div className="setting-row"><div><b>Accent color</b><small>Personalize your We Watch highlights.</small></div><div className="color-options">{swatches.map((color) => <button key={color} style={{ '--swatch': color }} className={preferences.accent.toLowerCase() === color ? 'selected' : ''} onClick={() => onChange({ accent: color })} aria-label={`Use ${color}`} />)}<label className="custom-color" title="Choose a custom color"><input type="color" value={preferences.accent} onChange={(event) => onChange({ accent: event.target.value })} /><Plus size={15} /></label></div></div></div>
     <div className="setting-group"><label className="setting-label"><Captions size={17} /> VLC activity overlay</label>
       <div className="setting-row"><div><b>Show playback notices</b><small>Display who played, paused, or sought on top of VLC.</small></div><label className="overlay-toggle"><input type="checkbox" checked={preferences.overlay.enabled} onChange={(event) => onChange({ overlay: { ...preferences.overlay, enabled: event.target.checked } })} /><span>{preferences.overlay.enabled ? 'On' : 'Off'}</span></label></div>
+      <fieldset className="overlay-options" disabled={!preferences.overlay.enabled}>
+      <div className="overlay-type-list"><div className="section-kicker">OVERLAY TYPES</div>{[
+        ['playback', 'Playback updates', 'Movie selected, play, pause, and seek notices.'],
+        ['roomActivity', 'Room activity', 'When members join or leave the room.'],
+        ['chat', 'Chat messages', 'Messages sent in the room chat.'],
+        ['reactions', 'Reactions', 'Quick reactions sent by members.'],
+      ].map(([type, label, description]) => <div className="setting-row" key={type}><div><b>{label}</b><small>{description}</small></div><label className="overlay-toggle"><input type="checkbox" checked={preferences.overlay.types[type]} onChange={(event) => onChange({ overlay: { ...preferences.overlay, types: { ...preferences.overlay.types, [type]: event.target.checked } } })} /><span>{preferences.overlay.types[type] ? 'On' : 'Off'}</span></label></div>)}</div>
       <div className="setting-row"><div><b>Position</b><small>Choose a VLC window corner or set an exact position.</small></div><select className="overlay-select" value={preferences.overlay.position} onChange={(event) => onChange({ overlay: { ...preferences.overlay, position: event.target.value } })}><option value="top-right">Top right</option><option value="top-left">Top left</option><option value="bottom-right">Bottom right</option><option value="bottom-left">Bottom left</option><option value="custom">Custom position</option></select></div>
       {preferences.overlay.position === 'custom' && <><div className="setting-row"><div><b>Horizontal position</b><small>Move from left to right across the VLC window.</small></div><div className="overlay-range"><input aria-label="Overlay horizontal position" type="range" min="0" max="100" value={preferences.overlay.customX} onChange={(event) => onChange({ overlay: { ...preferences.overlay, customX: Number(event.target.value) } })} /><em>{preferences.overlay.customX}%</em></div></div><div className="setting-row"><div><b>Vertical position</b><small>Move from top to bottom across the VLC window.</small></div><div className="overlay-range"><input aria-label="Overlay vertical position" type="range" min="0" max="100" value={preferences.overlay.customY} onChange={(event) => onChange({ overlay: { ...preferences.overlay, customY: Number(event.target.value) } })} /><em>{preferences.overlay.customY}%</em></div></div></>}
       <div className="setting-row"><div><b>Display duration</b><small>How long each notice stays visible.</small></div><div className="overlay-range"><input aria-label="Overlay display duration" type="range" min="1000" max="6000" step="250" value={preferences.overlay.duration} onChange={(event) => onChange({ overlay: { ...preferences.overlay, duration: Number(event.target.value) } })} /><em>{(preferences.overlay.duration / 1000).toFixed(1)} sec</em></div></div>
+      </fieldset>
     </div>
     <div className="settings-foot"><span><Check size={14} /> Preferences save automatically on this device.</span><button className="settings-done" onClick={onClose}>Done</button></div></section></div>;
 }

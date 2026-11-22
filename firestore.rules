@@ -32,6 +32,19 @@ service cloud.firestore {
           || (request.auth.uid == resource.data.hostUid
             && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['playbackControlsEnabled']))
           || (request.auth.uid == resource.data.hostUid
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['locked'])
+            && request.resource.data.locked is bool)
+          || (request.auth.uid == resource.data.hostUid
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['hostUid'])
+            && request.resource.data.hostUid != resource.data.hostUid
+            && request.resource.data.hostUid in resource.data.memberUids)
+          || (request.auth.uid == resource.data.hostUid
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['memberUids', 'memberCount'])
+            && request.resource.data.memberUids.size() == resource.data.memberUids.size() - 1
+            && resource.data.memberUids.hasAll(request.resource.data.memberUids)
+            && resource.data.hostUid in request.resource.data.memberUids
+            && request.resource.data.memberCount == request.resource.data.memberUids.size())
+          || (request.auth.uid == resource.data.hostUid
             && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['driftCorrection'])
             && request.resource.data.driftCorrection.enabled is bool
             && request.resource.data.driftCorrection.threshold is number
@@ -62,6 +75,7 @@ service cloud.firestore {
           && request.auth.uid in request.resource.data.memberUids
           && request.resource.data.memberUids.hasAll(resource.data.memberUids)
           && request.resource.data.memberCount == resource.data.memberCount + 1
+          && resource.data.get('locked', false) == false
           && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['memberUids', 'memberCount', 'playback', 'playbackCommand'])
           && request.resource.data.playbackCommand.by == request.auth.uid
           && request.resource.data.playbackCommand.action == 'pause'
