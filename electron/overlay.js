@@ -1,5 +1,6 @@
 const stack = document.getElementById('stack');
 const timers = new Map();
+const pendingNotices = [];
 let sequence = 0;
 const maximumNotices = 4;
 const cardHeight = 82;
@@ -26,7 +27,8 @@ function removeNotice(id, notice) {
   setTimeout(() => {
     notice.remove();
     updateWindowSize();
-    if (!stack.children.length) window.overlayApi.hide();
+    if (pendingNotices.length) showNotice(pendingNotices.shift());
+    else if (!stack.children.length) window.overlayApi.hide();
   }, 340);
 }
 
@@ -38,18 +40,21 @@ function makeNotice(payload, id) {
     join: { verb: 'joined', icon: '+', prep: 'AT' },
     leave: { verb: 'left', icon: '↗', prep: 'AT' },
     movie: { verb: 'selected', icon: '▣', prep: 'FILE' },
+    chat: { verb: 'said', icon: '…', prep: 'MESSAGE' },
+    reaction: { verb: 'reacted', icon: '♥', prep: 'WITH' },
   };
   const action = actions[payload.action] ? payload.action : 'pause';
   const details = actions[action];
   const notice = document.createElement('section');
   notice.className = 'notice enter';
   notice.dataset.id = id;
-  notice.setAttribute('aria-label', `${payload.name || 'A viewer'} ${details.verb}`);
+  const content = action === 'chat' ? payload.text : action === 'reaction' ? payload.reaction : '';
+  notice.setAttribute('aria-label', `${payload.name || 'A viewer'} ${details.verb}${content ? `: ${content}` : ''}`);
 
   const icon = document.createElement('div');
   icon.className = 'notice-icon';
   icon.setAttribute('aria-hidden', 'true');
-  icon.textContent = details.icon;
+  icon.textContent = action === 'reaction' ? String(payload.reaction || details.icon) : details.icon;
 
   const copy = document.createElement('div');
   copy.className = 'notice-copy';
@@ -65,8 +70,9 @@ function makeNotice(payload, id) {
   const preposition = document.createElement('span');
   preposition.textContent = details.prep;
   const time = document.createElement('time');
-  time.textContent = action === 'movie' ? String(payload.fileName || 'Movie selected') : formatTime(payload.position);
+  time.textContent = action === 'movie' ? String(payload.fileName || 'Movie selected') : action === 'chat' ? String(payload.text || '') : action === 'reaction' ? String(payload.reaction || '') : formatTime(payload.position);
   if (action === 'movie') timeLine.classList.add('file-name');
+  if (action === 'chat' || action === 'reaction') timeLine.classList.add('message-content');
   timeLine.append(preposition, time);
   copy.append(heading, timeLine);
 
@@ -79,15 +85,13 @@ function makeNotice(payload, id) {
 }
 
 function showNotice(payload) {
+  if (stack.children.length >= maximumNotices) {
+    pendingNotices.push(payload);
+    return;
+  }
   const id = ++sequence;
   const notice = makeNotice(payload, id);
   stack.prepend(notice);
-  while (stack.children.length > maximumNotices) {
-    const oldest = stack.lastElementChild;
-    clearTimeout(timers.get(Number(oldest.dataset.id)));
-    timers.delete(Number(oldest.dataset.id));
-    oldest.remove();
-  }
   updateWindowSize();
   const duration = Math.min(6000, Math.max(1000, Number(payload.duration) || 2000));
   timers.set(id, setTimeout(() => removeNotice(id, notice), duration));

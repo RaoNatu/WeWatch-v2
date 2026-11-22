@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { signInAnonymously, onAuthStateChanged } from 'firebase/auth';
-import { collection, doc, onSnapshot, runTransaction, serverTimestamp, updateDoc } from 'firebase/firestore';
+import { addDoc, collection, doc, limitToLast, onSnapshot, orderBy, query, runTransaction, serverTimestamp, updateDoc } from 'firebase/firestore';
 import { Activity, ArrowDownLeft, ArrowUpRight, Captions, Check, CircleHelp, Copy, Film, Gauge, Headphones, LayoutDashboard, Link2, LoaderCircle, LockKeyhole, Pause, Play, Plus, Radio, RefreshCw, Settings2, ShieldCheck, SlidersHorizontal, Type, Users, Wifi, X } from 'lucide-react';
 import { auth, db } from '../firebase';
 
@@ -111,6 +111,7 @@ function App() {
   const [codeInput, setCodeInput] = useState('');
   const [code, setCode] = useState('');
   const [members, setMembers] = useState([]);
+  const [messages, setMessages] = useState([]);
   const [room, setRoom] = useState(null);
   const [vlc, setVlc] = useState({ installed: false, running: false, managed: false });
   const [localPlayback, setLocalPlayback] = useState(null);
@@ -139,6 +140,7 @@ function App() {
   const lastPingReplyRef = useRef('');
   const sessionLoggedRef = useRef(false);
   const lastManagedStatusRef = useRef(null);
+  const messageSnapshotReadyRef = useRef(false);
 
   const driftThreshold = Math.max(2.5, Math.min(15, Number(room?.driftCorrection?.threshold) || 2.5));
   useEffect(() => { setDriftThresholdDraft(String(driftThreshold)); }, [driftThreshold]);
@@ -205,6 +207,8 @@ function App() {
     roomStateRef.current = null;
     memberSnapshotRef.current = [];
     memberNameCacheRef.current = new Map();
+    messageSnapshotReadyRef.current = false;
+    setMessages([]);
     const stopRoom = onSnapshot(roomRef(code), (snapshot) => {
       if (!snapshot.exists()) {
         const previous = roomStateRef.current;
@@ -238,8 +242,56 @@ function App() {
       nextMembers.forEach((member) => memberNameCacheRef.current.set(member.uid, member.name));
       setMembers(nextMembers);
     });
-    return () => { stopRoom(); stopMembers(); };
+    const messageQuery = query(collection(db, 'rooms', code, 'messages'), orderBy('createdAt', 'asc'), limitToLast(50));
+    const stopMessages = onSnapshot(messageQuery, { includeMetadataChanges: true }, (snapshot) => {
+      const initialServerSnapshot = !snapshot.metadata.fromCache && !messageSnapshotReadyRef.current;
+      if (initialServerSnapshot) messageSnapshotReadyRef.current = true;
+      else if (messageSnapshotReadyRef.current) {
+        snapshot.docChanges().filter((change) => change.type === 'added').forEach((change) => {
+          const message = change.doc.data();
+          if (message.uid === uid) return;
+          const actor = message.name || 'A viewer';
+          if (message.type === 'reaction' && message.reaction) {
+            window.desktop?.showPlaybackOverlay?.({ name: actor, action: 'reaction', reaction: message.reaction });
+            logEvent('Reaction', actor, message.reaction);
+          } else if (message.type === 'chat' && message.text) {
+            window.desktop?.showPlaybackOverlay?.({ name: actor, action: 'chat', text: message.text });
+            logEvent('Chat message', actor, message.text);
+          }
+        });
+      }
+      setMessages(snapshot.docs.map((message) => ({ id: message.id, ...message.data() })));
+    }, (e) => setError(`Room chat connection issue: ${e.message}`));
+    return () => { stopRoom(); stopMembers(); stopMessages(); };
   }, [code, uid, logEvent]);
+
+  const sendRoomMessage = async (type, value) => {
+    if (!code || !uid) return false;
+    const message = type === 'chat' ? String(value || '').trim().slice(0, 500) : '';
+    const reaction = type === 'reaction' ? String(value || '') : '';
+    if ((type === 'chat' && !message) || (type === 'reaction' && !['🍿', '❤️', '😂', '👏', '🔥'].includes(reaction))) return false;
+    try {
+      const actor = name.trim().slice(0, 24) || 'You';
+      await addDoc(collection(db, 'rooms', code, 'messages'), {
+        uid,
+        name: actor,
+        type,
+        ...(type === 'chat' ? { text: message } : { reaction }),
+        createdAt: serverTimestamp(),
+      });
+      if (type === 'chat') {
+        window.desktop?.showPlaybackOverlay?.({ name: actor, action: 'chat', text: message });
+        logEvent('Chat message', actor, message);
+      } else {
+        window.desktop?.showPlaybackOverlay?.({ name: actor, action: 'reaction', reaction });
+        logEvent('Reaction', actor, reaction);
+      }
+      return true;
+    } catch (e) {
+      setError(`Couldn't send ${type === 'chat' ? 'message' : 'reaction'}: ${e.message}`);
+      return false;
+    }
+  };
 
   const leaveRoom = async () => {
     if (!code || !uid) { setCode(''); return; }
@@ -371,7 +423,9 @@ function App() {
     const previous = lastLocalSampleRef.current;
     lastLocalSampleRef.current = current;
     if (!previous || applyingRemote.current) return;
-    const actionChanged = current.state !== previous.state && ['playing', 'paused'].includes(current.state);
+    const actionChanged = (previous.state === 'playing' && current.state === 'paused')
+      || (previous.state === 'paused' && current.state === 'playing')
+      || (previous.state === 'stopped' && current.state === 'playing');
     const canControl = !code || isHost || room?.playbackControlsEnabled;
     if (actionChanged && canControl) {
       const action = current.state === 'playing' ? 'play' : 'pause';
@@ -596,7 +650,7 @@ function App() {
             <button className="secondary-btn" disabled={Boolean(busy) || codeInput.length !== 6} onClick={() => runRoomAction('join', codeInput)}><span>{busy === 'join' ? 'Finding your room…' : 'Join the room'}</span>{busy === 'join' ? <LoaderCircle className="spin" size={19} /> : <ArrowUpRight size={19} />}</button>
             <div className="secure-note"><ShieldCheck size={17} /> Your invite is your key</div>
           </article>
-        </div> : <RoomView code={code} uid={uid} members={members} peer={peer} name={name} room={room} isHost={isHost} peerPlayback={peerPlayback} pingMs={room?.ping?.ms} driftLabel={driftLabel} driftThreshold={driftThreshold} driftThresholdDraft={driftThresholdDraft} onDriftThresholdChange={setDriftThresholdDraft} onSaveDriftThreshold={saveDriftThreshold} onToggleDriftCorrection={toggleDriftCorrection} copyCode={copyCode} onLeave={leaveRoom} leaving={busy === 'leave'} onToggleControls={toggleMemberControls} onSyncHost={syncWithHost} onSyncMembers={syncMembersToHost} />}
+        </div> : <RoomView code={code} uid={uid} members={members} messages={messages} onSendRoomMessage={sendRoomMessage} peer={peer} name={name} room={room} isHost={isHost} peerPlayback={peerPlayback} pingMs={room?.ping?.ms} driftLabel={driftLabel} driftThreshold={driftThreshold} driftThresholdDraft={driftThresholdDraft} onDriftThresholdChange={setDriftThresholdDraft} onSaveDriftThreshold={saveDriftThreshold} onToggleDriftCorrection={toggleDriftCorrection} copyCode={copyCode} onLeave={leaveRoom} leaving={busy === 'leave'} onToggleControls={toggleMemberControls} onSyncHost={syncWithHost} onSyncMembers={syncMembersToHost} />}
 
         <section className="setup-section">
           <div className="section-title"><div><span className="section-kicker">THE PROJECTOR BOOTH</span><h2>Your local player</h2></div><div className={`vlc-pill ${vlc.managed ? 'connected' : vlc.installed ? 'available' : 'missing'}`}><span />{statusLabel}</div></div>
@@ -622,7 +676,10 @@ function App() {
   </main>;
 }
 
-function RoomView({ code, uid, members, peer, name, room, isHost, peerPlayback, pingMs, driftLabel, driftThreshold, driftThresholdDraft, onDriftThresholdChange, onSaveDriftThreshold, onToggleDriftCorrection, copyCode, onLeave, leaving, onToggleControls, onSyncHost, onSyncMembers }) {
+function RoomView({ code, uid, members, messages, onSendRoomMessage, peer, name, room, isHost, peerPlayback, pingMs, driftLabel, driftThreshold, driftThresholdDraft, onDriftThresholdChange, onSaveDriftThreshold, onToggleDriftCorrection, copyCode, onLeave, leaving, onToggleControls, onSyncHost, onSyncMembers }) {
+  const [chatDraft, setChatDraft] = useState('');
+  const [chatSending, setChatSending] = useState(false);
+  const chatListRef = useRef(null);
   const host = members.find((member) => member.uid === room?.hostUid);
   const participants = [...members];
   if (!participants.some((member) => member.uid === uid)) participants.unshift({ uid, name });
@@ -630,6 +687,23 @@ function RoomView({ code, uid, members, peer, name, room, isHost, peerPlayback, 
   participants.sort((a, b) => (memberOrder.get(a.uid) ?? Number.MAX_SAFE_INTEGER) - (memberOrder.get(b.uid) ?? Number.MAX_SAFE_INTEGER));
   const formatPosition = (playback) => playback ? `${fmt(playback.position || 0)} / ${fmt(playback.duration || 0)}` : 'No movie playing';
   const thresholdDirty = Number(driftThresholdDraft) !== driftThreshold;
+  const reactions = ['🍿', '❤️', '😂', '👏', '🔥'];
+  const submitMessage = async (event) => {
+    event.preventDefault();
+    if (!chatDraft.trim() || chatSending) return;
+    setChatSending(true);
+    try { if (await onSendRoomMessage('chat', chatDraft)) setChatDraft(''); }
+    finally { setChatSending(false); }
+  };
+  const sendReaction = async (reaction) => {
+    if (chatSending) return;
+    setChatSending(true);
+    try { await onSendRoomMessage('reaction', reaction); }
+    finally { setChatSending(false); }
+  };
+  useEffect(() => {
+    if (chatListRef.current) chatListRef.current.scrollTop = chatListRef.current.scrollHeight;
+  }, [messages]);
   return <section className="active-room panel"><div className="room-live"><div><div className="section-kicker">YOUR PRIVATE ROOM · {members.length || 1}/6 WATCHING</div><h2>You're in. <em>Invite your people.</em></h2></div><button className="leave-btn" disabled={leaving} onClick={onLeave}><X size={18} /> {leaving ? (isHost ? 'Closing room…' : 'Leaving room…') : (isHost ? 'Close room for everyone' : 'Leave room')}</button></div><div className="room-invite"><div><span>SHARE THIS SIX-DIGIT ROOM CODE</span><strong>{code.slice(0, 3)} <b>{code.slice(3)}</b></strong></div><button className="copy-btn" onClick={copyCode}><Copy size={18} /> Copy invite code</button></div>
     <div className="current-user-banner"><span className="avatar current-user-avatar">{name.trim().slice(0, 1).toUpperCase() || 'Y'}</span><div><small>YOU'RE WATCHING AS</small><b>{name || 'Your profile'}</b></div><span className="current-user-role">{isHost ? 'HOST' : 'MEMBER'} · YOU</span></div>
     <div className="room-members">{participants.map((member) => { const isCurrentUser = member.uid === uid; const memberIsHost = member.uid === room?.hostUid; return <div className={`room-member ${isCurrentUser ? 'current-user-row' : ''}`} key={member.uid}><span className={`avatar ${isCurrentUser ? '' : 'friend'}`}>{member.name?.slice(0, 1).toUpperCase() || '＋'}</span><div><b>{member.name || (isCurrentUser ? 'You' : 'Guest')}</b><small>{memberIsHost ? 'HOST' : 'MEMBER'}{isCurrentUser ? ' · YOU' : ''}{member.playback?.paused === false ? ' · PLAYING' : ''}</small><small className="member-title"><Film size={11} /> {member.playback?.movie || 'Movie not selected'}</small><small className="member-movie">{formatPosition(member.playback)}</small></div><span className="member-ready"><Check size={12} /> {isCurrentUser ? 'YOU' : 'HERE'}</span></div>; })}</div>
@@ -641,7 +715,12 @@ function RoomView({ code, uid, members, peer, name, room, isHost, peerPlayback, 
         <div className="room-host-actions"><button className="sync-host-btn" onClick={onSyncMembers}><RefreshCw size={15} /> Sync members to host</button><button className={`control-toggle ${room?.playbackControlsEnabled ? 'enabled' : ''}`} onClick={onToggleControls}><span className="toggle-switch"><i /></span> Member playback controls <b>{room?.playbackControlsEnabled ? 'ON' : 'OFF'}</b></button></div>
       </div> : <button className="sync-host-btn" onClick={onSyncHost}><RefreshCw size={15} /> Sync with host</button>}
     </div>
-    <div className="room-hint"><LockKeyhole size={14} /> {isHost ? `Automatic drift correction is ${room?.driftCorrection?.enabled ? `on at ${driftThreshold}s` : 'off'}. Choose whether your guest can control playback.` : `The host is ${host?.name || 'your friend'}. ${room?.playbackControlsEnabled ? 'You can control playback.' : 'Playback controls are managed by the host.'} ${room?.driftCorrection?.enabled ? `Automatic correction is on at ${driftThreshold}s.` : ''}`}</div></section>;
+    <div className="room-hint"><LockKeyhole size={14} /> {isHost ? `Automatic drift correction is ${room?.driftCorrection?.enabled ? `on at ${driftThreshold}s` : 'off'}. Choose whether your guest can control playback.` : `The host is ${host?.name || 'your friend'}. ${room?.playbackControlsEnabled ? 'You can control playback.' : 'Playback controls are managed by the host.'} ${room?.driftCorrection?.enabled ? `Automatic correction is on at ${driftThreshold}s.` : ''}`}</div>
+    <section className="room-chat" aria-label="Room chat"><div className="room-chat-heading"><div><span className="section-kicker">WATCHING TOGETHER</span><h3>Room chat</h3></div><span className="chat-count">{messages.length} / 50</span></div>
+      <div className="reaction-picker" aria-label="Send a quick reaction">{reactions.map((reaction) => <button key={reaction} type="button" disabled={chatSending} onClick={() => sendReaction(reaction)} aria-label={`Send ${reaction} reaction`} title={`Send ${reaction}`}>{reaction}</button>)}</div>
+      <div className="chat-message-list" ref={chatListRef} aria-live="polite">{messages.length ? messages.map((message) => <article className={`chat-message ${message.uid === uid ? 'mine' : ''} ${message.type === 'reaction' ? 'reaction-message' : ''}`} key={message.id}><div className="chat-message-meta"><b>{message.name || 'Viewer'}</b><time>{wallClockFmt(message.createdAt?.toMillis?.() || Date.now())}</time></div>{message.type === 'reaction' ? <p className="chat-reaction">{message.reaction}</p> : <p>{message.text}</p>}</article>) : <p className="chat-empty">Say hello, or send a reaction to the room.</p>}</div>
+      <form className="chat-composer" onSubmit={submitMessage}><input value={chatDraft} onChange={(event) => setChatDraft(event.target.value)} maxLength={500} placeholder="Message everyone in the room…" aria-label="Room chat message" /><button type="submit" disabled={chatSending || !chatDraft.trim()} aria-label="Send message"><ArrowUpRight size={18} /></button></form>
+    </section></section>;
 }
 
 function SettingsPanel({ name, preferences, onNameChange, onChange, onClose }) {

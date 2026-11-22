@@ -124,12 +124,14 @@ async function showPlaybackOverlay(payload = {}) {
   if (!overlayConfig.enabled) return;
   createOverlayWindow();
   await positionOverlay();
-  const action = ['play', 'pause', 'seek', 'join', 'leave', 'movie'].includes(payload.action) ? payload.action : 'pause';
+  const action = ['play', 'pause', 'seek', 'join', 'leave', 'movie', 'chat', 'reaction'].includes(payload.action) ? payload.action : 'pause';
   const notification = {
     name: String(payload.name || 'A viewer').slice(0, 32),
     action,
     position: Math.max(0, Number(payload.position) || 0),
     fileName: String(payload.fileName || '').slice(0, 120),
+    text: String(payload.text || '').slice(0, 180),
+    reaction: String(payload.reaction || '').slice(0, 8),
     duration: overlayConfig.duration,
   };
   if (overlayReady && overlayWindow && !overlayWindow.webContents.isDestroyed()) overlayWindow.webContents.send('overlay:show', notification);
