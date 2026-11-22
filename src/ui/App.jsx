@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { signInAnonymously, onAuthStateChanged } from 'firebase/auth';
 import { collection, doc, onSnapshot, runTransaction, serverTimestamp, updateDoc } from 'firebase/firestore';
-import { Activity, ArrowDownLeft, ArrowUpRight, Captions, Check, CircleHelp, Clapperboard, Copy, Film, Gauge, Headphones, LayoutDashboard, Link2, LoaderCircle, LockKeyhole, Pause, Play, Plus, Radio, RefreshCw, Settings2, ShieldCheck, SlidersHorizontal, Type, Users, Wifi, X } from 'lucide-react';
+import { Activity, ArrowDownLeft, ArrowUpRight, Captions, Check, CircleHelp, Copy, Film, Gauge, Headphones, LayoutDashboard, Link2, LoaderCircle, LockKeyhole, Pause, Play, Plus, Radio, RefreshCw, Settings2, ShieldCheck, SlidersHorizontal, Type, Users, Wifi, X } from 'lucide-react';
 import { auth, db } from '../firebase';
 
 const fmt = (seconds = 0) => `${Math.floor(seconds / 60).toString().padStart(2, '0')}:${Math.floor(seconds % 60).toString().padStart(2, '0')}`;
@@ -20,6 +20,12 @@ const readActivity = () => {
 const roomRef = (code) => doc(db, 'rooms', code);
 const memberRef = (code, uid) => doc(db, 'rooms', code, 'members', uid);
 const defaultPreferences = { accent: '#bc4b32', fontScale: 1.2, layout: 'comfortable', overlay: { enabled: true, position: 'top-right', customX: 78, customY: 8, duration: 2000 } };
+const movieGreeting = (hour = new Date().getHours()) => {
+  if (hour >= 5 && hour < 12) return 'Movie Morning';
+  if (hour < 17) return 'Movie Day';
+  if (hour < 21) return 'Movie Evening';
+  return 'Movie Night';
+};
 const readPreferences = () => {
   try {
     const saved = JSON.parse(localStorage.getItem('wewatch-preferences') || '{}');
@@ -98,6 +104,7 @@ function App() {
   const [uid, setUid] = useState('');
   const [authReady, setAuthReady] = useState(false);
   const [name, setName] = useState(localStorage.getItem('wewatch-name') || '');
+  const [greeting, setGreeting] = useState(movieGreeting);
   const [preferences, setPreferences] = useState(readPreferences);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [codeInput, setCodeInput] = useState('');
@@ -132,6 +139,11 @@ function App() {
   const sessionLoggedRef = useRef(false);
   const lastManagedStatusRef = useRef(null);
 
+  useEffect(() => {
+    const timer = setInterval(() => setGreeting(movieGreeting()), 60_000);
+    return () => clearInterval(timer);
+  }, []);
+
   const logEvent = useCallback((event, actor = 'You', detail = '', severity = 'info') => {
     const entry = { id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, at: Date.now(), event, actor, detail, severity };
     setEvents((current) => [entry, ...current].slice(0, 80));
@@ -152,7 +164,7 @@ function App() {
   useEffect(() => {
     if (sessionLoggedRef.current) return;
     sessionLoggedRef.current = true;
-    logEvent('App opened', name || 'You', 'WeWatch session started');
+    logEvent('App opened', name || 'You', 'We Watch session started');
   }, [logEvent, name]);
 
   useEffect(() => {
@@ -312,18 +324,19 @@ function App() {
   useEffect(() => {
     const command = room?.playbackCommand;
     if (!code || !uid || !command?.id || command.by === uid) return;
-    if (!['play', 'pause', 'seek'].includes(command.action)) return;
+    if (!['play', 'pause', 'seek', 'sync', 'movie'].includes(command.action)) return;
     if (lastAnnouncedCommandRef.current !== command.id) {
       lastAnnouncedCommandRef.current = command.id;
       const actor = members.find((member) => member.uid === command.by);
       const actorName = actor?.name || command.name || (command.by === room?.hostUid ? 'Host' : 'Member');
       const action = command.overlayAction || command.action;
       const position = command.position ?? command.overlayPosition ?? localPlayback?.time ?? 0;
-      window.desktop?.showPlaybackOverlay?.({ name: actorName, action, position });
-      const eventLabel = action === 'join' ? 'Member joined' : action === 'leave' ? 'Member left' : action === 'seek' ? 'Seek' : 'Playback';
-      const detail = action === 'join' ? 'Joined the room' : action === 'leave' ? 'Left the room' : `${action === 'seek' ? 'Sought to' : action === 'pause' ? 'Paused at' : 'Played at'} ${clockFmt(position)}`;
+      window.desktop?.showPlaybackOverlay?.({ name: actorName, action, position, fileName: command.fileName });
+      const eventLabel = action === 'join' ? 'Member joined' : action === 'leave' ? 'Member left' : action === 'movie' ? 'Movie selected' : action === 'seek' ? 'Seek' : 'Playback';
+      const detail = action === 'movie' ? command.fileName || 'Movie selected' : action === 'join' ? 'Joined the room' : action === 'leave' ? 'Left the room' : `${action === 'seek' ? 'Sought to' : action === 'pause' ? 'Paused at' : 'Played at'} ${clockFmt(position)}`;
       logEvent(eventLabel, actorName, detail);
     }
+    if (command.action === 'movie') return;
     if (!vlc.managed || lastAppliedCommandRef.current === command.id) return;
     lastAppliedCommandRef.current = command.id;
     const joinedAt = members.find((member) => member.uid === uid)?.joinedAt?.toMillis?.();
@@ -331,14 +344,21 @@ function App() {
     if (joinedAt && commandAt && commandAt < joinedAt) return;
     applyingRemote.current = true;
     const applyCommand = async () => {
-      if (command.action === 'pause' && typeof command.position === 'number') await window.desktop.control('seek', command.position);
-      await window.desktop.control(command.action, command.position);
+      if (command.action === 'sync') {
+        const age = Math.min(3, Math.max(0, (Date.now() - (command.createdAt?.toMillis?.() || Date.now())) / 1000));
+        const target = (command.position || 0) + (command.paused ? 0 : age);
+        await window.desktop.control('seek', target);
+        await window.desktop.control(command.paused ? 'pause' : 'play');
+      } else {
+        if (command.action === 'pause' && typeof command.position === 'number') await window.desktop.control('seek', command.position);
+        await window.desktop.control(command.action, command.position);
+      }
       await refreshVlc();
     };
     applyCommand().catch((e) => setError(`Playback sync failed: ${e.message}`)).finally(() => {
       setTimeout(() => { applyingRemote.current = false; }, 1500);
     });
-  }, [code, uid, members, room?.hostUid, room?.playbackCommand?.id, room?.playbackCommand?.by, room?.playbackCommand?.action, room?.playbackCommand?.overlayAction, room?.playbackCommand?.position, room?.playbackCommand?.overlayPosition, room?.playbackCommand?.createdAt, localPlayback?.time, vlc.managed, refreshVlc, logEvent]);
+  }, [code, uid, members, room?.hostUid, room?.playbackCommand?.id, room?.playbackCommand?.by, room?.playbackCommand?.action, room?.playbackCommand?.fileName, room?.playbackCommand?.paused, room?.playbackCommand?.overlayAction, room?.playbackCommand?.position, room?.playbackCommand?.overlayPosition, room?.playbackCommand?.createdAt, localPlayback?.time, vlc.managed, refreshVlc, logEvent]);
 
   useEffect(() => {
     if (!localPlayback || !vlc.managed) return;
@@ -447,7 +467,7 @@ function App() {
   const driftLabel = drift === null ? 'Waiting for their player' : Math.abs(drift) <= 2.5 ? 'In sync' : `${isHost ? 'Guest' : 'Host'} ${fmt(Math.abs(drift))} ${drift > 0 ? 'behind' : 'ahead'}`;
   const copyCode = async () => { await navigator.clipboard.writeText(code); logEvent('Invite copied', name || 'You', `Room ${code}`); setToast('Room code copied'); setTimeout(() => setToast(''), 1800); };
   const startVlc = async () => { setError(''); try { await window.desktop.startVlc(); logEvent('VLC started', name || 'You', 'Started the managed player'); refreshVlc(); } catch (e) { setError(e.message); } };
-  const chooseMovie = async () => { setError(''); try { const picked = await window.desktop.chooseMovie(); if (picked) { setMediaName(picked.name); logEvent('Movie selected', name || 'You', picked.name); refreshVlc(); } } catch (e) { setError(e.message); } };
+  const chooseMovie = async () => { setError(''); try { const picked = await window.desktop.chooseMovie(); if (picked) { setMediaName(picked.name); logEvent('Movie selected', name || 'You', picked.name); window.desktop.showPlaybackOverlay?.({ name: name || 'You', action: 'movie', fileName: picked.name, position: localPlayback?.time || 0 }); if (code) await updateDoc(roomRef(code), { playbackCommand: { id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, action: 'movie', by: uid, name: name || 'You', fileName: picked.name, position: localPlayback?.time || 0, createdAt: serverTimestamp() } }); refreshVlc(); } } catch (e) { setError(e.message); } };
   const togglePlayback = async () => {
     if (!window.desktop || playbackActionBusyRef.current || (!isHost && code && !room?.playbackControlsEnabled)) return;
     playbackActionBusyRef.current = true;
@@ -488,6 +508,30 @@ function App() {
     } catch (e) { setError(e.message); }
     finally { setTimeout(() => { applyingRemote.current = false; }, 1500); }
   };
+  const syncMembersToHost = async () => {
+    if (!isHost || !code) return;
+    if (!vlc.managed) { setError('Start a movie in VLC before syncing members.'); return; }
+    try {
+      const current = await window.desktop.readPlayback();
+      if (!current) { setError('Could not read the host’s current VLC playback.'); return; }
+      const paused = current.state !== 'playing';
+      const position = Number(current.time) || 0;
+      const command = {
+        id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        action: 'sync',
+        overlayAction: 'seek',
+        by: uid,
+        name: name || 'You',
+        position,
+        paused,
+        overlayPosition: position,
+        createdAt: serverTimestamp(),
+      };
+      await updateDoc(roomRef(code), { playbackCommand: command });
+      logEvent('Members synced', name || 'You', `At ${clockFmt(position)} · ${paused ? 'paused' : 'playing'}`);
+      setToast('Members synced to you'); setTimeout(() => setToast(''), 1800);
+    } catch (e) { setError(`Couldn't sync members: ${e.message}`); }
+  };
   const toggleMemberControls = async () => {
     if (!isHost || !code) return;
     try {
@@ -501,17 +545,18 @@ function App() {
   const saveSettings = (next) => setPreferences((current) => ({ ...current, ...next }));
   const progress = localPlayback?.length ? Math.min(100, ((localPlayback.time || 0) / localPlayback.length) * 100) : 0;
   const title = localPlayback?.information?.category?.meta?.title || mediaName;
+  const welcomeMessage = name.trim() ? `Welcome, ${name.trim()}!` : 'A little closer, one frame at a time.';
 
   return <main className="app-shell">
     <header className="topbar">
-      <a className="brand" href="#home" aria-label="WeWatch home"><span className="brand-mark"><Clapperboard size={21} /></span><span className="brand-word">wewatch</span><span className="brand-beta">WATCH CLUB</span></a>
+      <a className="brand" href="#home" aria-label="We Watch home"><img className="brand-logo" src="/we-watch.png" alt="" /><span className="brand-word">We Watch</span><span className="brand-beta">WATCH CLUB</span></a>
       <div className="top-center"><span className="live-dot" /> YOUR PRIVATE LITTLE CINEMA</div>
-      <div className="top-actions"><span className="avatar">{name.trim().slice(0, 1).toUpperCase() || 'Y'}</span><span className="your-name">{name || 'Your profile'}</span><button className="icon-btn" aria-label="Settings" onClick={() => setSettingsOpen(true)}><Settings2 size={20} /><span>Settings</span></button></div>
+      <div className="top-actions"><span className="your-name">{name || 'Your profile'}</span><button className="icon-btn" aria-label="Settings" onClick={() => setSettingsOpen(true)}><Settings2 size={20} /><span>Settings</span></button></div>
     </header>
     <div className="main-layout" id="home">
       <section className="content">
-        <div className="eyebrow"><span>WEWATCH PRESENTS</span><i /></div>
-        <div className="intro"><div><h1>Movie night,<br /><em>together.</em></h1><p className="subtitle">A little closer, one frame at a time.</p></div><div className="heading-note"><span className="ticket-stub">ADMIT<br />TWO</span></div></div>
+        <div className="eyebrow"><span>WE WATCH PRESENTS</span><i /></div>
+        <div className="intro"><div><h1>{greeting},<br /><em>together.</em></h1><p className="subtitle">{welcomeMessage}</p></div><div className="heading-note"><span className="ticket-stub">ADMIT<br />TWO</span></div></div>
         {error && <div className="error-banner" role="alert"><span>{error}</span><button onClick={() => setError('')} aria-label="Dismiss"><X size={18} /></button></div>}
 
         {!code ? <div className="lobby-grid">
@@ -527,7 +572,7 @@ function App() {
             <button className="secondary-btn" disabled={Boolean(busy) || codeInput.length !== 6} onClick={() => runRoomAction('join', codeInput)}><span>{busy === 'join' ? 'Finding your room…' : 'Join the room'}</span>{busy === 'join' ? <LoaderCircle className="spin" size={19} /> : <ArrowUpRight size={19} />}</button>
             <div className="secure-note"><ShieldCheck size={17} /> Your invite is your key</div>
           </article>
-        </div> : <RoomView code={code} uid={uid} members={members} peer={peer} name={name} room={room} isHost={isHost} peerPlayback={peerPlayback} pingMs={room?.ping?.ms} driftLabel={driftLabel} copyCode={copyCode} onLeave={leaveRoom} leaving={busy === 'leave'} onToggleControls={toggleMemberControls} onSyncHost={syncWithHost} />}
+        </div> : <RoomView code={code} uid={uid} members={members} peer={peer} name={name} room={room} isHost={isHost} peerPlayback={peerPlayback} pingMs={room?.ping?.ms} driftLabel={driftLabel} copyCode={copyCode} onLeave={leaveRoom} leaving={busy === 'leave'} onToggleControls={toggleMemberControls} onSyncHost={syncWithHost} onSyncMembers={syncMembersToHost} />}
 
         <section className="setup-section">
           <div className="section-title"><div><span className="section-kicker">THE PROJECTOR BOOTH</span><h2>Your local player</h2></div><div className={`vlc-pill ${vlc.managed ? 'connected' : vlc.installed ? 'available' : 'missing'}`}><span />{statusLabel}</div></div>
@@ -547,13 +592,13 @@ function App() {
         </div>
       </aside>
     </div>
-    <div className="window-footer"><span><Activity size={15} /> {authReady ? 'Connected to the watch club' : 'Connecting to the watch club'}</span><span>WEWATCH DESKTOP <i>·</i> 0.1.0</span></div>
+    <div className="window-footer"><span><Activity size={15} /> {authReady ? 'Connected to the watch club' : 'Connecting to the watch club'}</span><span>WE WATCH DESKTOP <i>·</i> 0.1.0</span></div>
     {settingsOpen && <SettingsPanel name={name} preferences={preferences} onNameChange={setName} onChange={saveSettings} onClose={async () => { localStorage.setItem('wewatch-name', name.trim()); if (code && uid) updateDoc(memberRef(code, uid), { name: name.trim() }).catch(() => {}); setSettingsOpen(false); }} />}
     {toast && <div className="toast"><Check size={18} />{toast}</div>}
   </main>;
 }
 
-function RoomView({ code, uid, members, peer, name, room, isHost, peerPlayback, pingMs, driftLabel, copyCode, onLeave, leaving, onToggleControls, onSyncHost }) {
+function RoomView({ code, uid, members, peer, name, room, isHost, peerPlayback, pingMs, driftLabel, copyCode, onLeave, leaving, onToggleControls, onSyncHost, onSyncMembers }) {
   const host = members.find((member) => member.uid === room?.hostUid);
   const participants = [...members];
   if (!participants.some((member) => member.uid === uid)) participants.unshift({ uid, name });
@@ -563,7 +608,7 @@ function RoomView({ code, uid, members, peer, name, room, isHost, peerPlayback, 
   return <section className="active-room panel"><div className="room-live"><div><div className="section-kicker">YOUR PRIVATE ROOM · {members.length || 1}/6 WATCHING</div><h2>You're in. <em>Invite your people.</em></h2></div><button className="leave-btn" disabled={leaving} onClick={onLeave}><X size={18} /> {leaving ? (isHost ? 'Closing room…' : 'Leaving room…') : (isHost ? 'Close room for everyone' : 'Leave room')}</button></div><div className="room-invite"><div><span>SHARE THIS SIX-DIGIT ROOM CODE</span><strong>{code.slice(0, 3)} <b>{code.slice(3)}</b></strong></div><button className="copy-btn" onClick={copyCode}><Copy size={18} /> Copy invite code</button></div>
     <div className="current-user-banner"><span className="avatar current-user-avatar">{name.trim().slice(0, 1).toUpperCase() || 'Y'}</span><div><small>YOU'RE WATCHING AS</small><b>{name || 'Your profile'}</b></div><span className="current-user-role">{isHost ? 'HOST' : 'MEMBER'} · YOU</span></div>
     <div className="room-members">{participants.map((member) => { const isCurrentUser = member.uid === uid; const memberIsHost = member.uid === room?.hostUid; return <div className={`room-member ${isCurrentUser ? 'current-user-row' : ''}`} key={member.uid}><span className={`avatar ${isCurrentUser ? '' : 'friend'}`}>{member.name?.slice(0, 1).toUpperCase() || '＋'}</span><div><b>{member.name || (isCurrentUser ? 'You' : 'Guest')}</b><small>{memberIsHost ? 'HOST' : 'MEMBER'}{isCurrentUser ? ' · YOU' : ''}{member.playback?.paused === false ? ' · PLAYING' : ''}</small><small className="member-title"><Film size={11} /> {member.playback?.movie || 'Movie not selected'}</small><small className="member-movie">{formatPosition(member.playback)}</small></div><span className="member-ready"><Check size={12} /> {isCurrentUser ? 'YOU' : 'HERE'}</span></div>; })}</div>
-    <div className="room-controls"><div className="room-control-info"><span className="ping-tag"><Gauge size={14} /> {pingMs ? `${pingMs} ms relay ping` : 'Measuring room ping…'}</span><span className={`drift-tag ${driftLabel === 'In sync' ? 'good' : ''}`}>{driftLabel}</span></div>{isHost ? <button className={`control-toggle ${room?.playbackControlsEnabled ? 'enabled' : ''}`} onClick={onToggleControls}><span className="toggle-switch"><i /></span> Member playback controls <b>{room?.playbackControlsEnabled ? 'ON' : 'OFF'}</b></button> : <button className="sync-host-btn" onClick={onSyncHost}><RefreshCw size={15} /> Sync with host</button>}</div>
+    <div className="room-controls"><div className="room-control-info"><span className="ping-tag"><Gauge size={14} /> {pingMs ? `${pingMs} ms relay ping` : 'Measuring room ping…'}</span><span className={`drift-tag ${driftLabel === 'In sync' ? 'good' : ''}`}>{driftLabel}</span></div>{isHost ? <><button className="sync-host-btn" onClick={onSyncMembers}><RefreshCw size={15} /> Sync members to host</button><button className={`control-toggle ${room?.playbackControlsEnabled ? 'enabled' : ''}`} onClick={onToggleControls}><span className="toggle-switch"><i /></span> Member playback controls <b>{room?.playbackControlsEnabled ? 'ON' : 'OFF'}</b></button></> : <button className="sync-host-btn" onClick={onSyncHost}><RefreshCw size={15} /> Sync with host</button>}</div>
     <div className="room-hint"><LockKeyhole size={14} /> {isHost ? 'You are the host. Choose whether your guest can control playback.' : `The host is ${host?.name || 'your friend'}. ${room?.playbackControlsEnabled ? 'You can control playback.' : 'Playback controls are managed by the host.'}`}</div></section>;
 }
 
@@ -573,7 +618,7 @@ function SettingsPanel({ name, preferences, onNameChange, onChange, onClose }) {
     <div className="setting-group"><label className="setting-label"><Users size={15} /> Profile</label><div className="setting-row"><div><b>Display name</b><small>This is how you appear in rooms.</small></div><input className="settings-name" maxLength={24} value={name} onChange={(event) => onNameChange(event.target.value)} placeholder="Your name" /></div></div>
     <div className="setting-group"><label className="setting-label"><Type size={17} /> Appearance</label><div className="font-samples" aria-label="Typography samples"><div className="font-sample-display"><small>HEADLINES · PLAYFAIR DISPLAY</small><span>Movie night, together.</span></div><div className="font-sample-reading"><small>READING · DM SANS</small><span>Settle in. Your movie is ready.</span></div><div className="font-sample-utility"><small>DETAILS · DM MONO</small><span>ROOM CODE  123 456</span></div></div><div className="setting-row"><div><b>Text size</b><small>Scale text and interface icons from 90% to 200%.</small></div><div className="size-control"><span>A</span><input aria-label="Text size" type="range" min="0.9" max="2" step="0.05" value={preferences.fontScale} onChange={(event) => onChange({ fontScale: Number(event.target.value) })} /><strong>A</strong><em>{Math.round(preferences.fontScale * 100)}%</em></div></div>
     <div className="setting-row"><div><b>Layout spacing</b><small>Choose how much room the panels get.</small></div><div className="layout-options">{['compact', 'comfortable', 'spacious'].map((layout) => <button key={layout} className={preferences.layout === layout ? 'selected' : ''} onClick={() => onChange({ layout })}><LayoutDashboard size={14} />{layout}</button>)}</div></div>
-    <div className="setting-row"><div><b>Accent color</b><small>Personalize your WeWatch highlights.</small></div><div className="color-options">{swatches.map((color) => <button key={color} style={{ '--swatch': color }} className={preferences.accent.toLowerCase() === color ? 'selected' : ''} onClick={() => onChange({ accent: color })} aria-label={`Use ${color}`} />)}<label className="custom-color" title="Choose a custom color"><input type="color" value={preferences.accent} onChange={(event) => onChange({ accent: event.target.value })} /><Plus size={15} /></label></div></div></div>
+    <div className="setting-row"><div><b>Accent color</b><small>Personalize your We Watch highlights.</small></div><div className="color-options">{swatches.map((color) => <button key={color} style={{ '--swatch': color }} className={preferences.accent.toLowerCase() === color ? 'selected' : ''} onClick={() => onChange({ accent: color })} aria-label={`Use ${color}`} />)}<label className="custom-color" title="Choose a custom color"><input type="color" value={preferences.accent} onChange={(event) => onChange({ accent: event.target.value })} /><Plus size={15} /></label></div></div></div>
     <div className="setting-group"><label className="setting-label"><Captions size={17} /> VLC activity overlay</label>
       <div className="setting-row"><div><b>Show playback notices</b><small>Display who played, paused, or sought on top of VLC.</small></div><label className="overlay-toggle"><input type="checkbox" checked={preferences.overlay.enabled} onChange={(event) => onChange({ overlay: { ...preferences.overlay, enabled: event.target.checked } })} /><span>{preferences.overlay.enabled ? 'On' : 'Off'}</span></label></div>
       <div className="setting-row"><div><b>Position</b><small>Choose a VLC window corner or set an exact position.</small></div><select className="overlay-select" value={preferences.overlay.position} onChange={(event) => onChange({ overlay: { ...preferences.overlay, position: event.target.value } })}><option value="top-right">Top right</option><option value="top-left">Top left</option><option value="bottom-right">Bottom right</option><option value="bottom-left">Bottom left</option><option value="custom">Custom position</option></select></div>

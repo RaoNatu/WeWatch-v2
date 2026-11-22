@@ -16,6 +16,8 @@ let vlcLookupDone = false;
 let vlcSpawnError;
 let closingWindow = false;
 let allowWindowClose = false;
+let allowAppQuit = false;
+let vlcShutdownPromise;
 let closeFallbackTimer;
 let overlayWindow;
 let overlayReady = false;
@@ -122,11 +124,12 @@ async function showPlaybackOverlay(payload = {}) {
   if (!overlayConfig.enabled) return;
   createOverlayWindow();
   await positionOverlay();
-  const action = ['play', 'pause', 'seek', 'join', 'leave'].includes(payload.action) ? payload.action : 'pause';
+  const action = ['play', 'pause', 'seek', 'join', 'leave', 'movie'].includes(payload.action) ? payload.action : 'pause';
   const notification = {
     name: String(payload.name || 'A viewer').slice(0, 32),
     action,
     position: Math.max(0, Number(payload.position) || 0),
+    fileName: String(payload.fileName || '').slice(0, 120),
     duration: overlayConfig.duration,
   };
   if (overlayReady && overlayWindow && !overlayWindow.webContents.isDestroyed()) overlayWindow.webContents.send('overlay:show', notification);
@@ -150,7 +153,27 @@ ipcMain.on('overlay:resize', (_event, height) => {
 ipcMain.on('overlay:show', (_event, payload) => { showPlaybackOverlay(payload).catch(() => {}); });
 ipcMain.on('overlay:hide', () => overlayWindow?.hide());
 
-function finishWindowClose() {
+async function closeManagedVlc() {
+  if (vlcShutdownPromise) return vlcShutdownPromise;
+  const child = vlcProcess;
+  if (!child || child.exitCode !== null || child.signalCode !== null) return;
+
+  vlcShutdownPromise = (async () => {
+    const exited = new Promise((resolve) => child.once('exit', resolve));
+    try { child.kill('SIGTERM'); } catch {}
+    await Promise.race([exited, new Promise((resolve) => setTimeout(resolve, 1500))]);
+    if (child.exitCode === null && child.signalCode === null) {
+      try { child.kill('SIGKILL'); } catch {}
+      await Promise.race([exited, new Promise((resolve) => setTimeout(resolve, 1000))]);
+    }
+    if (vlcProcess === child) vlcProcess = null;
+  })().finally(() => { vlcShutdownPromise = null; });
+  return vlcShutdownPromise;
+}
+
+async function finishWindowClose() {
+  if (!win || allowWindowClose) return;
+  await closeManagedVlc();
   if (!win || allowWindowClose) return;
   allowWindowClose = true;
   clearTimeout(closeFallbackTimer);
@@ -164,6 +187,8 @@ function createWindow() {
     height: 920,
     minWidth: 1080,
     minHeight: 720,
+    title: 'We Watch',
+    icon: path.join(__dirname, '../public/we-watch.png'),
     backgroundColor: '#111210',
     ...(process.platform === 'win32' ? { titleBarStyle: 'hidden', titleBarOverlay: { color: '#111210', symbolColor: '#d9e0d1', height: 36 } } : {}),
     webPreferences: {
@@ -237,7 +262,7 @@ async function launchVlc(filePath) {
   }
   vlcPort = await availablePort();
   vlcPassword = crypto.randomBytes(18).toString('hex');
-  const args = ['--extraintf', 'http', '--http-host', '127.0.0.1', '--http-port', String(vlcPort), '--http-password', vlcPassword, '--no-video-title-show'];
+  const args = ['--no-one-instance', '--extraintf', 'http', '--http-host', '127.0.0.1', '--http-port', String(vlcPort), '--http-password', vlcPassword, '--no-video-title-show'];
   if (filePath) args.push(filePath);
   vlcSpawnError = null;
   vlcProcess = spawn(vlcBinary, args, { detached: false, windowsHide: true, stdio: 'ignore' });
@@ -250,7 +275,7 @@ async function launchVlc(filePath) {
 }
 
 async function vlcCommand(command, value) {
-  if (!vlcPort || !vlcPassword) throw new Error('Start VLC from WeWatch before controlling playback.');
+  if (!vlcPort || !vlcPassword) throw new Error('Start VLC from We Watch before controlling playback.');
   const url = new URL(`http://127.0.0.1:${vlcPort}/requests/status.json`);
   if (command) url.searchParams.set('command', command);
   if (value !== undefined) url.searchParams.set(command === 'seek' ? 'val' : 'input', value);
@@ -285,5 +310,13 @@ ipcMain.handle('vlc:read', async () => {
   try { return await vlcCommand(''); } catch { return null; }
 });
 
+app.on('before-quit', (event) => {
+  if (allowAppQuit) return;
+  event.preventDefault();
+  allowAppQuit = true;
+  closeManagedVlc().finally(() => app.quit());
+});
+
+app.setName('We Watch');
 app.whenReady().then(createWindow);
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });

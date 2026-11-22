@@ -1,8 +1,8 @@
 {
-  "name": "wewatch",
+  "name": "we-watch",
   "version": "0.1.0",
   "private": true,
-  "description": "Watch movies together with synchronized VLC playback.",
+  "description": "We Watch — watch movies together with synchronized VLC playback.",
   "main": "electron/main.cjs",
   "scripts": {
     "dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on tcp:127.0.0.1:5173 && electron .\"",
@@ -26,10 +26,10 @@
   },
   "build": {
     "appId": "com.wewatch.desktop",
-    "productName": "WeWatch",
-    "files": ["dist/**/*", "electron/**/*", "package.json"],
+    "productName": "We Watch",
+    "files": ["dist/**/*", "electron/**/*", "public/**/*", "package.json"],
     "directories": { "output": "release" },
-    "linux": { "target": ["AppImage", "deb"], "category": "AudioVideo" },
-    "win": { "target": ["nsis"] }
+    "linux": { "target": ["AppImage", "deb"], "category": "AudioVideo", "icon": "public/we-watch.png" },
+    "win": { "target": ["nsis"], "icon": "public/we-watch.ico" }
   }
 }

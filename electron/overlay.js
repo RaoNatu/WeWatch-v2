@@ -37,6 +37,7 @@ function makeNotice(payload, id) {
     seek: { verb: 'sought', icon: '↔', prep: 'TO' },
     join: { verb: 'joined', icon: '+', prep: 'AT' },
     leave: { verb: 'left', icon: '↗', prep: 'AT' },
+    movie: { verb: 'selected', icon: '▣', prep: 'FILE' },
   };
   const action = actions[payload.action] ? payload.action : 'pause';
   const details = actions[action];
@@ -64,13 +65,15 @@ function makeNotice(payload, id) {
   const preposition = document.createElement('span');
   preposition.textContent = details.prep;
   const time = document.createElement('time');
-  time.textContent = formatTime(payload.position);
+  time.textContent = action === 'movie' ? String(payload.fileName || 'Movie selected') : formatTime(payload.position);
+  if (action === 'movie') timeLine.classList.add('file-name');
   timeLine.append(preposition, time);
   copy.append(heading, timeLine);
 
-  const mark = document.createElement('span');
+  const mark = document.createElement('img');
   mark.className = 'brand-mark';
-  mark.textContent = 'WW';
+  mark.src = '../public/we-watch.png';
+  mark.alt = '';
   notice.append(icon, copy, mark);
   return notice;
 }

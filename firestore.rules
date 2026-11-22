@@ -20,11 +20,15 @@ service cloud.firestore {
           (request.resource.data.diff(resource.data).affectedKeys().hasOnly(['playback'])
             && request.auth.uid == resource.data.hostUid)
           || (request.resource.data.diff(resource.data).affectedKeys().hasOnly(['playbackCommand'])
-            && (request.auth.uid == resource.data.hostUid || resource.data.playbackControlsEnabled == true)
+            && (request.auth.uid == resource.data.hostUid
+              || request.resource.data.playbackCommand.action == 'movie'
+              || resource.data.playbackControlsEnabled == true)
             && request.resource.data.playbackCommand.by == request.auth.uid
-            && request.resource.data.playbackCommand.action in ['play', 'pause', 'seek']
+            && request.resource.data.playbackCommand.action in ['play', 'pause', 'seek', 'movie']
             && (request.resource.data.playbackCommand.action != 'seek'
-              || request.resource.data.playbackCommand.position is number))
+              || request.resource.data.playbackCommand.position is number)
+            && (request.resource.data.playbackCommand.action != 'movie'
+              || request.resource.data.playbackCommand.fileName is string))
           || (request.auth.uid == resource.data.hostUid
             && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['playbackControlsEnabled']))
           || (request.auth.uid == resource.data.hostUid

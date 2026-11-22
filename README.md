@@ -1,6 +1,6 @@
-# WeWatch
+# We Watch
 
-WeWatch is a desktop app for watching the same locally stored movie together. It uses Firebase anonymous authentication and Cloud Firestore for six digit rooms and playback state. Movie files stay on each viewer's device.
+We Watch is a desktop app for watching the same locally stored movie together. It uses Firebase anonymous authentication and Cloud Firestore for six digit rooms and playback state. Movie files stay on each viewer's device.
 
 ## Requirements
 
@@ -14,7 +14,7 @@ WeWatch is a desktop app for watching the same locally stored movie together. It
 1. Install dependencies with `npm install`.
 2. Configure Firebase and publish `firestore.rules` (see below).
 3. Start the app with `npm run dev`.
-4. Use **Start VLC** in WeWatch or **Choose movie & launch** to start a managed VLC session. Choose the same movie file on each computer.
+4. Use **Start VLC** in We Watch or **Choose movie & launch** to start a managed VLC session. Choose the same movie file on each computer.
 5. Create a room and share its six digit code.
 
 ## Build installers
@@ -41,8 +41,8 @@ In Firebase Console for the configured project, enable **Authentication → Anon
 
 ## Playback and rooms
 
-WeWatch starts VLC with its HTTP control interface bound to `127.0.0.1` on a random port and a random password held by Electron's main process. It sends play, pause, and seek updates through Firestore. Rooms support up to six people. The host can close a room; guests can leave without closing it. Member playback controls are enabled by default for new rooms and can be turned off by the host.
+We Watch starts VLC with its HTTP control interface bound to `127.0.0.1` on a random port and a random password held by Electron's main process. It sends play, pause, and seek updates through Firestore. Rooms support up to six people. The host can close a room; guests can leave without closing it. Member playback controls are enabled by default for new rooms and can be turned off by the host.
 
-Everyone needs the same movie file locally. WeWatch does not transfer movie files, subtitles, or VLC installations. Playback is best-effort synchronization; network delay and VLC seek behavior can cause small offsets. The room ping measures a Firebase relay round trip rather than a direct device-to-device connection.
+Everyone needs the same movie file locally. We Watch does not transfer movie files, subtitles, or VLC installations. Playback is best-effort synchronization; network delay and VLC seek behavior can cause small offsets. The room ping measures a Firebase relay round trip rather than a direct device-to-device connection.
 
 The optional VLC overlay shows playback and room events. Its position, duration, and enabled state are configurable in Settings. The app's event log is local to the device and retains the latest 80 entries. Profile name and appearance settings are also saved locally.
