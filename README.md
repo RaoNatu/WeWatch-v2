@@ -1,32 +1,48 @@
 # WeWatch
 
-WeWatch is a Windows/Linux desktop MVP for watching the same local movie together. It uses Firebase anonymous authentication and Cloud Firestore for six digit rooms and playback state. VLC runs locally on each device; movie files are never uploaded.
+WeWatch is a desktop app for watching the same locally stored movie together. It uses Firebase anonymous authentication and Cloud Firestore for six digit rooms and playback state. Movie files stay on each viewer's device.
 
-## Run it
+## Requirements
 
-1. Install Node.js 20 or newer and VLC media player.
-2. In Firebase Console for `wewatch-v2`, enable **Authentication → Anonymous** and create a **Cloud Firestore** database.
-3. Publish the included `firestore.rules` to the Firestore database.
-4. Run `npm install`, then `npm run dev`.
-5. Create a room, share its six digit code, and have both people choose the same movie file in WeWatch.
+- Windows 10/11 or a recent Linux desktop distribution
+- Node.js 20 or newer for development and packaging
+- VLC media player installed separately on every computer
+- A configured Firebase project (see [Firebase setup](#firebase-setup))
 
-To package a desktop installer, run `npm run dist`. The build configuration produces an AppImage and `.deb` for Linux, and an NSIS installer for Windows. Build each operating system's installer on that operating system.
+## Run from source
 
-## Playback behavior
+1. Install dependencies with `npm install`.
+2. Configure Firebase and publish `firestore.rules` (see below).
+3. Start the app with `npm run dev`.
+4. Use **Start VLC** in WeWatch or **Choose movie & launch** to start a managed VLC session. Choose the same movie file on each computer.
+5. Create a room and share its six digit code.
 
-The app starts VLC with its HTTP control interface bound to `127.0.0.1` on a random port, protected by a random password held by Electron's main process. It reads playback position and sends play, pause, and seek updates through Firestore. Everyone in a room must have the same movie file available locally. Playback is best-effort synchronization; network delay and VLC seek behavior can cause a small offset.
+## Build installers
 
-Room members publish their current movie and timeline to their member record. Member playback controls are enabled by default for new rooms; the host can turn them off. Guests can manually seek to the host's reported position. The host's ping indicator measures a Firebase relay round trip (host → room → guest → room → host), so it includes cloud and network delay rather than measuring a direct device-to-device connection. Drift is estimated from the latest reported VLC positions.
+The production web bundle is built with `npm run build`. Electron Builder writes desktop packages into `release/`.
 
-Profile name, text/interface scale, layout spacing, and accent color are saved locally on each device.
+On Linux, build the AppImage with:
 
-## Firebase notes
+```sh
+npx electron-builder --linux AppImage
+```
 
-The Firebase web configuration is included in `src/firebase.js`. These values identify the Firebase project and are not server credentials. Anonymous Authentication must be enabled. The supplied rules block collection listing and writes from non-members. Joining requires a signed-in user to look up a known room code, so exact room document reads are allowed for signed-in users; production deployments should add Firebase App Check and a server-side rate limit for room lookups.
+On Windows, build the NSIS installer (`.exe`) with:
 
-## Current MVP limits
+```powershell
+npx electron-builder --win nsis
+```
 
-- Rooms support up to six members. The host can close the room for everyone; guests who leave or close WeWatch are removed while the room stays open.
-- The app does not transfer movie files, subtitles, voice chat, or VLC installations.
-- VLC detection can find the player executable and running process. Playback control is available after starting VLC through WeWatch, which enables the local control interface.
-- Firebase must be configured in the supplied project and have the rules above deployed before room creation works.
+The Linux AppImage can be built on Linux. For the Windows installer, use a Windows build machine. Run the resulting installer and AppImage on their target systems before distributing them. VLC and Firebase configuration are prerequisites at runtime; neither VLC nor movie files are bundled.
+
+## Firebase setup
+
+In Firebase Console for the configured project, enable **Authentication → Anonymous** and create a **Cloud Firestore** database. Publish the included `firestore.rules`. The Firebase web configuration in `src/firebase.js` identifies the project; it is not a server credential. The supplied rules block collection listing and writes from non-members. Joining requires an authenticated exact room-code lookup. Production deployments should add Firebase App Check and a server-side rate limit for room lookups.
+
+## Playback and rooms
+
+WeWatch starts VLC with its HTTP control interface bound to `127.0.0.1` on a random port and a random password held by Electron's main process. It sends play, pause, and seek updates through Firestore. Rooms support up to six people. The host can close a room; guests can leave without closing it. Member playback controls are enabled by default for new rooms and can be turned off by the host.
+
+Everyone needs the same movie file locally. WeWatch does not transfer movie files, subtitles, or VLC installations. Playback is best-effort synchronization; network delay and VLC seek behavior can cause small offsets. The room ping measures a Firebase relay round trip rather than a direct device-to-device connection.
+
+The optional VLC overlay shows playback and room events. Its position, duration, and enabled state are configurable in Settings. The app's event log is local to the device and retains the latest 80 entries. Profile name and appearance settings are also saved locally.

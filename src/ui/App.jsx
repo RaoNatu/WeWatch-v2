@@ -1,13 +1,25 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { signInAnonymously, onAuthStateChanged } from 'firebase/auth';
 import { collection, doc, onSnapshot, runTransaction, serverTimestamp, updateDoc } from 'firebase/firestore';
-import { Activity, ArrowDownLeft, ArrowUpRight, Check, CircleHelp, Clapperboard, Copy, Film, Gauge, Headphones, LayoutDashboard, Link2, LoaderCircle, LockKeyhole, Pause, Play, Plus, Radio, RefreshCw, Settings2, ShieldCheck, SlidersHorizontal, Type, Users, Wifi, X } from 'lucide-react';
+import { Activity, ArrowDownLeft, ArrowUpRight, Captions, Check, CircleHelp, Clapperboard, Copy, Film, Gauge, Headphones, LayoutDashboard, Link2, LoaderCircle, LockKeyhole, Pause, Play, Plus, Radio, RefreshCw, Settings2, ShieldCheck, SlidersHorizontal, Type, Users, Wifi, X } from 'lucide-react';
 import { auth, db } from '../firebase';
 
 const fmt = (seconds = 0) => `${Math.floor(seconds / 60).toString().padStart(2, '0')}:${Math.floor(seconds % 60).toString().padStart(2, '0')}`;
+const clockFmt = (seconds = 0) => {
+  const value = Math.max(0, Math.floor(Number(seconds) || 0));
+  return [Math.floor(value / 3600), Math.floor((value % 3600) / 60), value % 60].map((part) => String(part).padStart(2, '0')).join(':');
+};
+const wallClockFmt = (value) => {
+  const date = new Date(value);
+  return [date.getHours(), date.getMinutes(), date.getSeconds()].map((part) => String(part).padStart(2, '0')).join(':');
+};
+const readActivity = () => {
+  try { return JSON.parse(localStorage.getItem('wewatch-activity') || '[]').slice(0, 80); }
+  catch { return []; }
+};
 const roomRef = (code) => doc(db, 'rooms', code);
 const memberRef = (code, uid) => doc(db, 'rooms', code, 'members', uid);
-const defaultPreferences = { accent: '#bc4b32', fontScale: 1.2, layout: 'comfortable' };
+const defaultPreferences = { accent: '#bc4b32', fontScale: 1.2, layout: 'comfortable', overlay: { enabled: true, position: 'top-right', customX: 78, customY: 8, duration: 2000 } };
 const readPreferences = () => {
   try {
     const saved = JSON.parse(localStorage.getItem('wewatch-preferences') || '{}');
@@ -15,7 +27,7 @@ const readPreferences = () => {
     if (Number(saved.fontScale) === 1.05) saved.fontScale = 1.2;
     // Replace the previous lime default with the new cinema-paper theme's brick accent.
     if (saved.accent?.toLowerCase() === '#d4f37b') saved.accent = '#bc4b32';
-    return { ...defaultPreferences, ...saved };
+    return { ...defaultPreferences, ...saved, overlay: { ...defaultPreferences.overlay, ...saved.overlay } };
   } catch { return defaultPreferences; }
 };
 
@@ -39,15 +51,15 @@ async function createRoom(uid, name, initialPlayback) {
 
 async function joinRoom(uid, name, code) {
   const ref = roomRef(code);
-  await runTransaction(db, async (tx) => {
+  const outcome = await runTransaction(db, async (tx) => {
     const room = await tx.get(ref);
     if (!room.exists()) throw new Error('No room found with that code.');
     const data = room.data();
-    if ((data.memberUids || []).includes(uid)) return;
+    if ((data.memberUids || []).includes(uid)) return { position: data.playback?.position || 0, didJoin: false };
     if ((data.memberUids || []).length >= 6) throw new Error('This room is full. Rooms can have up to six people.');
     const hostPlayback = data.playback || { position: 0, duration: 0, movie: '' };
     const joinPosition = hostPlayback.position || 0;
-    const command = { id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, action: 'pause', position: joinPosition, by: uid, createdAt: serverTimestamp() };
+    const command = { id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, action: 'pause', overlayAction: 'join', position: joinPosition, by: uid, name, createdAt: serverTimestamp() };
     tx.update(ref, {
       memberUids: [...(data.memberUids || []), uid],
       memberCount: (data.memberUids || []).length + 1,
@@ -55,8 +67,9 @@ async function joinRoom(uid, name, code) {
       playbackCommand: command,
     });
     tx.set(memberRef(code, uid), { uid, name, joinedAt: serverTimestamp(), playback: { position: 0, duration: 0, movie: '', paused: true, updatedAt: serverTimestamp() } });
+    return { position: joinPosition, didJoin: true };
   });
-  return code;
+  return { code, ...outcome };
 }
 
 async function exitRoom(code, uid) {
@@ -97,10 +110,15 @@ function App() {
   const [busy, setBusy] = useState('');
   const [error, setError] = useState('');
   const [toast, setToast] = useState('');
+  const [events, setEvents] = useState(readActivity);
+  const roomStateRef = useRef(null);
+  const memberSnapshotRef = useRef([]);
+  const memberNameCacheRef = useRef(new Map());
   const deletingRoomRef = useRef(false);
   const lastSentRef = useRef(0);
   const applyingRemote = useRef(false);
   const lastAppliedCommandRef = useRef('');
+  const lastAnnouncedCommandRef = useRef('');
   const initialCommandRoomRef = useRef('');
   const initializedPlaybackRoomRef = useRef('');
   const playbackRefreshRequestRef = useRef(0);
@@ -111,13 +129,42 @@ function App() {
   const [playbackActionBusy, setPlaybackActionBusy] = useState(false);
   const pingSentRef = useRef(null);
   const lastPingReplyRef = useRef('');
+  const sessionLoggedRef = useRef(false);
+  const lastManagedStatusRef = useRef(null);
+
+  const logEvent = useCallback((event, actor = 'You', detail = '', severity = 'info') => {
+    const entry = { id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, at: Date.now(), event, actor, detail, severity };
+    setEvents((current) => [entry, ...current].slice(0, 80));
+  }, []);
 
   useEffect(() => {
     localStorage.setItem('wewatch-preferences', JSON.stringify(preferences));
     document.documentElement.style.setProperty('--lime', preferences.accent);
     document.documentElement.style.setProperty('--font-scale', String(preferences.fontScale));
     document.body.dataset.layout = preferences.layout;
+    window.desktop?.configureOverlay?.(preferences.overlay);
   }, [preferences]);
+
+  useEffect(() => {
+    localStorage.setItem('wewatch-activity', JSON.stringify(events));
+  }, [events]);
+
+  useEffect(() => {
+    if (sessionLoggedRef.current) return;
+    sessionLoggedRef.current = true;
+    logEvent('App opened', name || 'You', 'WeWatch session started');
+  }, [logEvent, name]);
+
+  useEffect(() => {
+    if (error) logEvent('Error', name || 'You', error, 'error');
+  }, [error, logEvent, name]);
+
+  useEffect(() => {
+    const previous = lastManagedStatusRef.current;
+    lastManagedStatusRef.current = vlc.managed;
+    if (previous === null || previous === vlc.managed) return;
+    logEvent(vlc.managed ? 'VLC connected' : 'VLC disconnected', name || 'You', vlc.managed ? 'Playback controls ready' : 'Managed player connection ended', vlc.managed ? 'success' : 'warning');
+  }, [vlc.managed, logEvent, name]);
 
   useEffect(() => onAuthStateChanged(auth, (user) => {
     if (user) { setUid(user.uid); setAuthReady(true); }
@@ -139,14 +186,44 @@ function App() {
 
   useEffect(() => {
     if (!code) return undefined;
+    roomStateRef.current = null;
+    memberSnapshotRef.current = [];
+    memberNameCacheRef.current = new Map();
     const stopRoom = onSnapshot(roomRef(code), (snapshot) => {
-      if (!snapshot.exists()) { if (!deletingRoomRef.current) setError('This room has ended.'); setCode(''); return; }
+      if (!snapshot.exists()) {
+        const previous = roomStateRef.current;
+        if (previous?.hostUid && previous.hostUid !== uid) {
+          const hostName = memberNameCacheRef.current.get(previous.hostUid) || 'Host';
+          window.desktop?.showPlaybackOverlay?.({ name: hostName, action: 'leave', position: previous.playback?.position || 0 });
+          logEvent('Room closed', hostName, 'Host closed the room');
+        }
+        roomStateRef.current = null;
+        if (!deletingRoomRef.current) setError('This room has ended.');
+        setCode('');
+        return;
+      }
+      const nextRoom = snapshot.data();
+      const previousRoom = roomStateRef.current;
+      if (previousRoom && previousRoom.memberUids && nextRoom.memberUids) {
+        const removed = previousRoom.memberUids.filter((memberUid) => !nextRoom.memberUids.includes(memberUid) && memberUid !== uid);
+        removed.forEach((memberUid) => {
+          const memberName = memberNameCacheRef.current.get(memberUid) || 'A member';
+          window.desktop?.showPlaybackOverlay?.({ name: memberName, action: 'leave', position: previousRoom.playback?.position || 0 });
+          logEvent('Member left', memberName, 'Left the room');
+        });
+      }
+      roomStateRef.current = nextRoom;
       roomReceivedAtRef.current = Date.now();
-      setRoom(snapshot.data());
+      setRoom(nextRoom);
     }, (e) => setError(`Room connection issue: ${e.message}`));
-    const stopMembers = onSnapshot(collection(db, 'rooms', code, 'members'), (snapshot) => setMembers(snapshot.docs.map((d) => ({ ...d.data(), receivedAt: Date.now() }))));
+    const stopMembers = onSnapshot(collection(db, 'rooms', code, 'members'), (snapshot) => {
+      const nextMembers = snapshot.docs.map((d) => ({ ...d.data(), receivedAt: Date.now() }));
+      memberSnapshotRef.current = nextMembers;
+      nextMembers.forEach((member) => memberNameCacheRef.current.set(member.uid, member.name));
+      setMembers(nextMembers);
+    });
     return () => { stopRoom(); stopMembers(); };
-  }, [code]);
+  }, [code, uid, logEvent]);
 
   const leaveRoom = async () => {
     if (!code || !uid) { setCode(''); return; }
@@ -155,8 +232,12 @@ function App() {
     deletingRoomRef.current = true;
     try {
       await exitRoom(code, uid);
+      window.desktop?.showPlaybackOverlay?.({ name: name || 'You', action: 'leave', position: localPlayback?.time || 0 });
+      logEvent(isHost ? 'Room closed' : 'Left room', name || 'You', isHost ? 'Closed the room for everyone' : 'Left the room');
       setMembers([]);
       setRoom(null);
+      roomStateRef.current = null;
+      memberSnapshotRef.current = [];
       setCode('');
     } catch (e) {
       setError(`Couldn't close the room: ${e.message}`);
@@ -180,14 +261,19 @@ function App() {
   const peer = members.find((member) => member.uid !== uid);
   const peerPlayback = peer?.playback;
   const publishPlaybackCommand = useCallback((action, position) => {
-    const command = { id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, action, by: uid, createdAt: serverTimestamp() };
+    const displayPosition = position ?? localPlayback?.time ?? 0;
+    const command = { id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, action, by: uid, name: name || 'You', overlayPosition: displayPosition, createdAt: serverTimestamp() };
     if (position !== undefined) command.position = position;
+    window.desktop?.showPlaybackOverlay?.({ name: name || 'You', action, position: displayPosition });
+    const verb = action === 'seek' ? 'Sought to' : action === 'pause' ? 'Paused at' : 'Played at';
+    logEvent(action === 'seek' ? 'Seek' : 'Playback', name || 'You', `${verb} ${clockFmt(displayPosition)}`);
     return updateDoc(roomRef(code), { playbackCommand: command });
-  }, [code, uid]);
+  }, [code, uid, name, localPlayback?.time, logEvent]);
 
   useEffect(() => {
     initializedPlaybackRoomRef.current = '';
     lastAppliedCommandRef.current = '';
+    lastAnnouncedCommandRef.current = '';
     initialCommandRoomRef.current = '';
     lastLocalSampleRef.current = null;
   }, [code]);
@@ -196,6 +282,7 @@ function App() {
     if (!code || !room || initialCommandRoomRef.current === code) return;
     initialCommandRoomRef.current = code;
     lastAppliedCommandRef.current = room.playbackCommand?.id || '';
+    lastAnnouncedCommandRef.current = room.playbackCommand?.id || '';
   }, [code, room]);
 
   useEffect(() => {
@@ -224,8 +311,20 @@ function App() {
 
   useEffect(() => {
     const command = room?.playbackCommand;
-    if (!code || !uid || !vlc.managed || !command?.id || command.by === uid || lastAppliedCommandRef.current === command.id) return;
+    if (!code || !uid || !command?.id || command.by === uid) return;
     if (!['play', 'pause', 'seek'].includes(command.action)) return;
+    if (lastAnnouncedCommandRef.current !== command.id) {
+      lastAnnouncedCommandRef.current = command.id;
+      const actor = members.find((member) => member.uid === command.by);
+      const actorName = actor?.name || command.name || (command.by === room?.hostUid ? 'Host' : 'Member');
+      const action = command.overlayAction || command.action;
+      const position = command.position ?? command.overlayPosition ?? localPlayback?.time ?? 0;
+      window.desktop?.showPlaybackOverlay?.({ name: actorName, action, position });
+      const eventLabel = action === 'join' ? 'Member joined' : action === 'leave' ? 'Member left' : action === 'seek' ? 'Seek' : 'Playback';
+      const detail = action === 'join' ? 'Joined the room' : action === 'leave' ? 'Left the room' : `${action === 'seek' ? 'Sought to' : action === 'pause' ? 'Paused at' : 'Played at'} ${clockFmt(position)}`;
+      logEvent(eventLabel, actorName, detail);
+    }
+    if (!vlc.managed || lastAppliedCommandRef.current === command.id) return;
     lastAppliedCommandRef.current = command.id;
     const joinedAt = members.find((member) => member.uid === uid)?.joinedAt?.toMillis?.();
     const commandAt = command.createdAt?.toMillis?.();
@@ -239,29 +338,37 @@ function App() {
     applyCommand().catch((e) => setError(`Playback sync failed: ${e.message}`)).finally(() => {
       setTimeout(() => { applyingRemote.current = false; }, 1500);
     });
-  }, [code, uid, members, room?.playbackCommand?.id, room?.playbackCommand?.by, room?.playbackCommand?.action, room?.playbackCommand?.createdAt, vlc.managed, refreshVlc]);
+  }, [code, uid, members, room?.hostUid, room?.playbackCommand?.id, room?.playbackCommand?.by, room?.playbackCommand?.action, room?.playbackCommand?.overlayAction, room?.playbackCommand?.position, room?.playbackCommand?.overlayPosition, room?.playbackCommand?.createdAt, localPlayback?.time, vlc.managed, refreshVlc, logEvent]);
 
   useEffect(() => {
     if (!localPlayback || !vlc.managed) return;
     const current = { time: localPlayback.time || 0, state: localPlayback.state, at: Date.now() };
     const previous = lastLocalSampleRef.current;
     lastLocalSampleRef.current = current;
-    if (!previous || applyingRemote.current || !code) return;
+    if (!previous || applyingRemote.current) return;
     const actionChanged = current.state !== previous.state && ['playing', 'paused'].includes(current.state);
-    const canControl = isHost || room?.playbackControlsEnabled;
+    const canControl = !code || isHost || room?.playbackControlsEnabled;
     if (actionChanged && canControl) {
       const action = current.state === 'playing' ? 'play' : 'pause';
       const recent = lastLocalCommandRef.current;
       if (recent?.action === action && current.at - recent.at < 5000) lastLocalCommandRef.current = null;
-      else publishPlaybackCommand(action).catch((e) => setError(`Couldn't sync playback: ${e.message}`));
+      else if (code) publishPlaybackCommand(action).catch((e) => setError(`Couldn't sync playback: ${e.message}`));
+      else {
+        window.desktop?.showPlaybackOverlay?.({ name: name || 'You', action, position: current.time });
+        logEvent('Playback', name || 'You', `${action === 'pause' ? 'Paused at' : 'Played at'} ${clockFmt(current.time)}`);
+      }
     }
     if (!canControl) return;
     const elapsed = Math.max(0, (current.at - previous.at) / 1000);
     const expectedAdvance = previous.state === 'playing' ? elapsed : 0;
     const seekDelta = current.time - previous.time - expectedAdvance;
     if (Math.abs(seekDelta) < 1.75) return;
-    publishPlaybackCommand('seek', current.time).catch((e) => setError(`Couldn't sync seek: ${e.message}`));
-  }, [code, uid, isHost, room?.playbackControlsEnabled, localPlayback?.time, localPlayback?.state, vlc.managed, publishPlaybackCommand]);
+    if (code) publishPlaybackCommand('seek', current.time).catch((e) => setError(`Couldn't sync seek: ${e.message}`));
+    else {
+      window.desktop?.showPlaybackOverlay?.({ name: name || 'You', action: 'seek', position: current.time });
+      logEvent('Seek', name || 'You', `Sought to ${clockFmt(current.time)}`);
+    }
+  }, [code, uid, name, isHost, room?.playbackControlsEnabled, localPlayback?.time, localPlayback?.state, vlc.managed, publishPlaybackCommand, logEvent]);
 
   useEffect(() => {
     if (!code || !uid || !localPlayback || !vlc.managed) return;
@@ -309,11 +416,25 @@ function App() {
       if (!authReady || !uid) throw new Error('Connecting securely to Firebase…');
       if (!name.trim()) throw new Error('Add your name before entering a room.');
       localStorage.setItem('wewatch-name', name.trim());
-      const joinedCode = action === 'create' ? await createRoom(uid, name.trim(), vlc.managed ? localPlayback : null) : await joinRoom(uid, name.trim(), value);
+      let joinedCode;
+      let joinedPosition = 0;
+      if (action === 'create') joinedCode = await createRoom(uid, name.trim(), vlc.managed ? localPlayback : null);
+      else {
+        const joined = await joinRoom(uid, name.trim(), value);
+        joinedCode = joined.code;
+        joinedPosition = joined.position;
+        if (joined.didJoin) window.desktop?.showPlaybackOverlay?.({ name: name.trim(), action: 'join', position: joined.position });
+      }
       if (action === 'create' && vlc.managed) {
-        try { await window.desktop.control('pause'); await refreshVlc(); }
+        try {
+          const wasPlaying = localPlayback?.state === 'playing';
+          await window.desktop.control('pause');
+          if (wasPlaying) window.desktop.showPlaybackOverlay?.({ name: name.trim(), action: 'pause', position: localPlayback?.time || 0 });
+          await refreshVlc();
+        }
         catch (e) { setError(`Room created, but VLC could not be paused: ${e.message}`); }
       }
+      logEvent(action === 'create' ? 'Room created' : 'Joined room', name.trim(), action === 'create' ? `Room ${joinedCode} · member controls enabled` : `Room ${joinedCode} · host position ${clockFmt(joinedPosition)}`);
       setCode(joinedCode); setCodeInput('');
     } catch (e) { setError(e.message || 'Something went wrong. Please try again.'); }
     finally { setBusy(''); }
@@ -324,9 +445,9 @@ function App() {
   const ownPos = localPlayback?.time || 0;
   const drift = peerPlayback ? ownPos - peerPos : null;
   const driftLabel = drift === null ? 'Waiting for their player' : Math.abs(drift) <= 2.5 ? 'In sync' : `${isHost ? 'Guest' : 'Host'} ${fmt(Math.abs(drift))} ${drift > 0 ? 'behind' : 'ahead'}`;
-  const copyCode = async () => { await navigator.clipboard.writeText(code); setToast('Room code copied'); setTimeout(() => setToast(''), 1800); };
-  const startVlc = async () => { setError(''); try { await window.desktop.startVlc(); refreshVlc(); } catch (e) { setError(e.message); } };
-  const chooseMovie = async () => { setError(''); try { const picked = await window.desktop.chooseMovie(); if (picked) { setMediaName(picked.name); refreshVlc(); } } catch (e) { setError(e.message); } };
+  const copyCode = async () => { await navigator.clipboard.writeText(code); logEvent('Invite copied', name || 'You', `Room ${code}`); setToast('Room code copied'); setTimeout(() => setToast(''), 1800); };
+  const startVlc = async () => { setError(''); try { await window.desktop.startVlc(); logEvent('VLC started', name || 'You', 'Started the managed player'); refreshVlc(); } catch (e) { setError(e.message); } };
+  const chooseMovie = async () => { setError(''); try { const picked = await window.desktop.chooseMovie(); if (picked) { setMediaName(picked.name); logEvent('Movie selected', name || 'You', picked.name); refreshVlc(); } } catch (e) { setError(e.message); } };
   const togglePlayback = async () => {
     if (!window.desktop || playbackActionBusyRef.current || (!isHost && code && !room?.playbackControlsEnabled)) return;
     playbackActionBusyRef.current = true;
@@ -338,6 +459,11 @@ function App() {
       lastLocalCommandRef.current = { action, at: Date.now() };
       await window.desktop.control(action);
       if (code && (isHost || room?.playbackControlsEnabled)) await publishPlaybackCommand(action);
+      else if (!code) {
+        const position = current?.time ?? localPlayback?.time ?? 0;
+        window.desktop.showPlaybackOverlay?.({ name: name || 'You', action, position });
+        logEvent('Playback', name || 'You', `${action === 'pause' ? 'Paused at' : 'Played at'} ${clockFmt(position)}`);
+      }
       await refreshVlc();
     } catch (e) { setError(`Playback control failed: ${e.message}`); }
     finally { playbackActionBusyRef.current = false; setPlaybackActionBusy(false); }
@@ -357,15 +483,21 @@ function App() {
         await window.desktop.control(shouldPlay ? 'play' : 'pause');
       }
       await refreshVlc();
+      logEvent('Synced with host', name || 'You', `At ${clockFmt(target)} · ${shouldPlay ? 'playing' : 'paused'}`);
       setToast('Synced with the host'); setTimeout(() => setToast(''), 1800);
     } catch (e) { setError(e.message); }
     finally { setTimeout(() => { applyingRemote.current = false; }, 1500); }
   };
   const toggleMemberControls = async () => {
     if (!isHost || !code) return;
-    try { await updateDoc(roomRef(code), { playbackControlsEnabled: !room.playbackControlsEnabled }); }
+    try {
+      const enabled = !room.playbackControlsEnabled;
+      await updateDoc(roomRef(code), { playbackControlsEnabled: enabled });
+      logEvent('Room controls changed', name || 'You', `Member playback ${enabled ? 'enabled' : 'disabled'}`);
+    }
     catch (e) { setError(e.message); }
   };
+  const clearActivity = () => setEvents([]);
   const saveSettings = (next) => setPreferences((current) => ({ ...current, ...next }));
   const progress = localPlayback?.length ? Math.min(100, ((localPlayback.time || 0) / localPlayback.length) * 100) : 0;
   const title = localPlayback?.information?.category?.meta?.title || mediaName;
@@ -407,11 +539,12 @@ function App() {
           <div className="feature-row"><div><Wifi size={19} /><span>Low-latency sync</span></div><div><Users size={19} /><span>Up to six together</span></div><div><Headphones size={19} /><span>Bring your own movie</span></div></div>
         </section>
       </section>
-      <aside className="side-rail">
-        <div className="side-top"><span className="section-kicker">THE MAGIC, IN REAL TIME</span><h2>Two sofas.<br /><em>One shared moment.</em></h2><p>WeWatch lines up both VLC players, so the only thing you need to agree on is what to watch.</p></div>
-        <div className="sync-visual"><div className="visual-top"><span><span className="live-dot" /> ROOM SNAPSHOT</span><span className="visual-code">{code || '— — —'}</span></div><div className="visual-screen"><div className="screen-content"><div className="screen-play"><Play size={18} fill="currentColor" /></div><span>{peerPlayback?.movie || (title !== 'No movie selected' ? title : 'YOUR MOVIE GOES HERE')}</span></div><div className="screen-bottom"><span>{peerPlayback ? fmt(peerPlayback.position || 0) : '—:——'}</span><div className="screen-track"><i style={{ width: `${peerPlayback?.duration ? Math.min(100, (peerPlayback.position / peerPlayback.duration) * 100) : 0}%` }} /></div><span>{peerPlayback?.duration ? fmt(peerPlayback.duration) : '—:——'}</span></div></div><div className="sync-people"><div className="person"><span className="avatar small">{name.trim().slice(0, 1).toUpperCase() || 'Y'}</span><span><b>{name || 'You'}</b><small>{isHost ? 'HOST PLAYER' : 'YOUR PLAYER'}</small></span><i className={vlc.managed ? 'person-online' : ''} /></div><div className="sync-wave"><span /><span /><span /><span /><span /><span /><span /></div><div className="person"><span className="avatar small friend">{peer?.name?.slice(0, 1).toUpperCase() || '＋'}</span><span><b>{peer?.name || 'Your person'}</b><small>{peerPlayback?.paused === false ? fmt(peerPlayback.position) + ' PLAYING' : peer ? 'PLAYER PAUSED' : 'WAITING FOR THEM'}</small></span><i className={peer ? 'person-online' : ''} /></div></div><div className="peer-meta"><span><Gauge size={16} /> {room?.ping?.ms ? `Room ping · ${room.ping.ms} ms` : 'Room ping · measuring'}</span><b className={drift === null ? '' : Math.abs(drift) <= 2.5 ? 'good' : 'warn'}>{driftLabel}</b></div></div>
-        <div className="tip-card"><div className="tip-icon"><CircleHelp size={19} /></div><div><b>Bring your own popcorn.</b><p>Everyone needs the same movie file. WeWatch handles the timing.</p><a href="https://www.videolan.org/vlc/" target="_blank" rel="noreferrer">Get VLC media player <ArrowUpRight size={15} /></a></div></div>
-        <div className="side-footer"><span>MADE FOR THE DISTANCE</span><span>✳</span></div>
+      <aside className="side-rail activity-rail">
+        <div className="activity-header"><span className="section-kicker">LOCAL DEBUG HISTORY</span><div className="activity-title-row"><div><h2>Activity log</h2><p>Playback, room events, and errors</p></div><button className="activity-clear" onClick={clearActivity} disabled={!events.length}>Clear</button></div><div className="activity-summary"><span><i /> Captured on this device</span><b>{events.length} / 80</b></div></div>
+        <div className="activity-list" aria-live="polite">
+          {!events.length && <div className="activity-empty"><Activity size={22} /><b>No events yet</b><span>App actions will appear here with their time and user.</span></div>}
+          {events.map((entry) => <article className={`activity-entry ${entry.severity || 'info'}`} key={entry.id}><time dateTime={new Date(entry.at).toISOString()}>{wallClockFmt(entry.at)}</time><span className="activity-marker" /><div className="activity-entry-copy"><div><b>{entry.actor}</b><strong>{entry.event}</strong></div>{entry.detail && <p>{entry.detail}</p>}</div></article>)}
+        </div>
       </aside>
     </div>
     <div className="window-footer"><span><Activity size={15} /> {authReady ? 'Connected to the watch club' : 'Connecting to the watch club'}</span><span>WEWATCH DESKTOP <i>·</i> 0.1.0</span></div>
@@ -424,6 +557,8 @@ function RoomView({ code, uid, members, peer, name, room, isHost, peerPlayback, 
   const host = members.find((member) => member.uid === room?.hostUid);
   const participants = [...members];
   if (!participants.some((member) => member.uid === uid)) participants.unshift({ uid, name });
+  const memberOrder = new Map((room?.memberUids || []).map((memberUid, index) => [memberUid, index]));
+  participants.sort((a, b) => (memberOrder.get(a.uid) ?? Number.MAX_SAFE_INTEGER) - (memberOrder.get(b.uid) ?? Number.MAX_SAFE_INTEGER));
   const formatPosition = (playback) => playback ? `${fmt(playback.position || 0)} / ${fmt(playback.duration || 0)}` : 'No movie playing';
   return <section className="active-room panel"><div className="room-live"><div><div className="section-kicker">YOUR PRIVATE ROOM · {members.length || 1}/6 WATCHING</div><h2>You're in. <em>Invite your people.</em></h2></div><button className="leave-btn" disabled={leaving} onClick={onLeave}><X size={18} /> {leaving ? (isHost ? 'Closing room…' : 'Leaving room…') : (isHost ? 'Close room for everyone' : 'Leave room')}</button></div><div className="room-invite"><div><span>SHARE THIS SIX-DIGIT ROOM CODE</span><strong>{code.slice(0, 3)} <b>{code.slice(3)}</b></strong></div><button className="copy-btn" onClick={copyCode}><Copy size={18} /> Copy invite code</button></div>
     <div className="current-user-banner"><span className="avatar current-user-avatar">{name.trim().slice(0, 1).toUpperCase() || 'Y'}</span><div><small>YOU'RE WATCHING AS</small><b>{name || 'Your profile'}</b></div><span className="current-user-role">{isHost ? 'HOST' : 'MEMBER'} · YOU</span></div>
@@ -439,6 +574,12 @@ function SettingsPanel({ name, preferences, onNameChange, onChange, onClose }) {
     <div className="setting-group"><label className="setting-label"><Type size={17} /> Appearance</label><div className="font-samples" aria-label="Typography samples"><div className="font-sample-display"><small>HEADLINES · PLAYFAIR DISPLAY</small><span>Movie night, together.</span></div><div className="font-sample-reading"><small>READING · DM SANS</small><span>Settle in. Your movie is ready.</span></div><div className="font-sample-utility"><small>DETAILS · DM MONO</small><span>ROOM CODE  123 456</span></div></div><div className="setting-row"><div><b>Text size</b><small>Scale text and interface icons from 90% to 200%.</small></div><div className="size-control"><span>A</span><input aria-label="Text size" type="range" min="0.9" max="2" step="0.05" value={preferences.fontScale} onChange={(event) => onChange({ fontScale: Number(event.target.value) })} /><strong>A</strong><em>{Math.round(preferences.fontScale * 100)}%</em></div></div>
     <div className="setting-row"><div><b>Layout spacing</b><small>Choose how much room the panels get.</small></div><div className="layout-options">{['compact', 'comfortable', 'spacious'].map((layout) => <button key={layout} className={preferences.layout === layout ? 'selected' : ''} onClick={() => onChange({ layout })}><LayoutDashboard size={14} />{layout}</button>)}</div></div>
     <div className="setting-row"><div><b>Accent color</b><small>Personalize your WeWatch highlights.</small></div><div className="color-options">{swatches.map((color) => <button key={color} style={{ '--swatch': color }} className={preferences.accent.toLowerCase() === color ? 'selected' : ''} onClick={() => onChange({ accent: color })} aria-label={`Use ${color}`} />)}<label className="custom-color" title="Choose a custom color"><input type="color" value={preferences.accent} onChange={(event) => onChange({ accent: event.target.value })} /><Plus size={15} /></label></div></div></div>
+    <div className="setting-group"><label className="setting-label"><Captions size={17} /> VLC activity overlay</label>
+      <div className="setting-row"><div><b>Show playback notices</b><small>Display who played, paused, or sought on top of VLC.</small></div><label className="overlay-toggle"><input type="checkbox" checked={preferences.overlay.enabled} onChange={(event) => onChange({ overlay: { ...preferences.overlay, enabled: event.target.checked } })} /><span>{preferences.overlay.enabled ? 'On' : 'Off'}</span></label></div>
+      <div className="setting-row"><div><b>Position</b><small>Choose a VLC window corner or set an exact position.</small></div><select className="overlay-select" value={preferences.overlay.position} onChange={(event) => onChange({ overlay: { ...preferences.overlay, position: event.target.value } })}><option value="top-right">Top right</option><option value="top-left">Top left</option><option value="bottom-right">Bottom right</option><option value="bottom-left">Bottom left</option><option value="custom">Custom position</option></select></div>
+      {preferences.overlay.position === 'custom' && <><div className="setting-row"><div><b>Horizontal position</b><small>Move from left to right across the VLC window.</small></div><div className="overlay-range"><input aria-label="Overlay horizontal position" type="range" min="0" max="100" value={preferences.overlay.customX} onChange={(event) => onChange({ overlay: { ...preferences.overlay, customX: Number(event.target.value) } })} /><em>{preferences.overlay.customX}%</em></div></div><div className="setting-row"><div><b>Vertical position</b><small>Move from top to bottom across the VLC window.</small></div><div className="overlay-range"><input aria-label="Overlay vertical position" type="range" min="0" max="100" value={preferences.overlay.customY} onChange={(event) => onChange({ overlay: { ...preferences.overlay, customY: Number(event.target.value) } })} /><em>{preferences.overlay.customY}%</em></div></div></>}
+      <div className="setting-row"><div><b>Display duration</b><small>How long each notice stays visible.</small></div><div className="overlay-range"><input aria-label="Overlay display duration" type="range" min="1000" max="6000" step="250" value={preferences.overlay.duration} onChange={(event) => onChange({ overlay: { ...preferences.overlay, duration: Number(event.target.value) } })} /><em>{(preferences.overlay.duration / 1000).toFixed(1)} sec</em></div></div>
+    </div>
     <div className="settings-foot"><span><Check size={14} /> Preferences save automatically on this device.</span><button className="settings-done" onClick={onClose}>Done</button></div></section></div>;
 }
 

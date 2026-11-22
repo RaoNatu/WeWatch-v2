@@ -12,4 +12,6 @@ contextBridge.exposeInMainWorld('desktop', {
     return () => ipcRenderer.removeListener('app:before-close', listener);
   },
   closeCleanupDone: () => ipcRenderer.send('app:close-cleanup-done'),
+  configureOverlay: (config) => ipcRenderer.send('overlay:config', config),
+  showPlaybackOverlay: (payload) => ipcRenderer.send('overlay:show', payload),
 });

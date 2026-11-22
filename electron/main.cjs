@@ -1,4 +1,4 @@
-const { app, BrowserWindow, dialog, ipcMain } = require('electron');
+const { app, BrowserWindow, dialog, ipcMain, screen } = require('electron');
 const { spawn, execFile } = require('node:child_process');
 const { promisify } = require('node:util');
 const path = require('node:path');
@@ -17,11 +17,144 @@ let vlcSpawnError;
 let closingWindow = false;
 let allowWindowClose = false;
 let closeFallbackTimer;
+let overlayWindow;
+let overlayReady = false;
+let pendingOverlay = [];
+let overlayConfig = { enabled: true, position: 'top-right', customX: 78, customY: 8, duration: 2000 };
+
+const OVERLAY_WIDTH = 430;
+const OVERLAY_CARD_HEIGHT = 82;
+const OVERLAY_GAP = 8;
+const OVERLAY_MAX_ITEMS = 4;
+let overlayHeight = OVERLAY_CARD_HEIGHT;
+
+function normalizedOverlayConfig(value = {}) {
+  const positions = ['top-right', 'top-left', 'bottom-right', 'bottom-left', 'custom'];
+  return {
+    enabled: value.enabled !== false,
+    position: positions.includes(value.position) ? value.position : 'top-right',
+    customX: Math.max(0, Math.min(100, Number(value.customX) || 0)),
+    customY: Math.max(0, Math.min(100, Number(value.customY) || 0)),
+    duration: Math.max(1000, Math.min(6000, Number(value.duration) || 2000)),
+  };
+}
+
+async function getVlcWindowBounds() {
+  try {
+    if (process.platform === 'win32') {
+      const script = `Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public struct WWRECT { public int Left; public int Top; public int Right; public int Bottom; } public static class WWUSER32 { [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out WWRECT rect); }'; Get-Process vlc -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | ForEach-Object { $r = New-Object WWRECT; [WWUSER32]::GetWindowRect($_.MainWindowHandle, [ref]$r) | Out-Null; [pscustomobject]@{x=$r.Left; y=$r.Top; width=$r.Right-$r.Left; height=$r.Bottom-$r.Top} } | Select-Object -First 1 | ConvertTo-Json -Compress`;
+      const { stdout } = await execFileAsync('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', script], { timeout: 1200, windowsHide: true });
+      const value = JSON.parse(stdout.trim() || 'null');
+      if (value && value.width > 0 && value.height > 0) return value;
+    }
+    if (process.platform === 'linux') {
+      const { stdout } = await execFileAsync('wmctrl', ['-lpG'], { timeout: 800 });
+      const pid = vlcProcess?.pid;
+      const line = stdout.split(/\r?\n/).find((entry) => {
+        const fields = entry.trim().split(/\s+/);
+        return fields.length >= 7 && Number(fields[2]) === pid;
+      });
+      if (line) {
+        const fields = line.trim().split(/\s+/);
+        const bounds = { x: Number(fields[3]), y: Number(fields[4]), width: Number(fields[5]), height: Number(fields[6]) };
+        if (bounds.width > 0 && bounds.height > 0) return bounds;
+      }
+    }
+  } catch {}
+  return null;
+}
+
+async function positionOverlay() {
+  if (!overlayWindow) return;
+  const target = await getVlcWindowBounds();
+  const display = screen.getDisplayNearestPoint(screen.getCursorScreenPoint()) || screen.getPrimaryDisplay();
+  const area = target || display.workArea;
+  const { x, y, width, height } = area;
+  const margin = 24;
+  const maxX = x + Math.max(margin, width - OVERLAY_WIDTH - margin);
+  const maxY = y + Math.max(margin, height - overlayHeight - margin);
+  let left = maxX;
+  let top = y + margin;
+  if (overlayConfig.position === 'top-left') left = x + margin;
+  if (overlayConfig.position === 'bottom-right') top = maxY;
+  if (overlayConfig.position === 'bottom-left') { left = x + margin; top = maxY; }
+  if (overlayConfig.position === 'custom') {
+    left = x + Math.round((width - OVERLAY_WIDTH) * (overlayConfig.customX / 100));
+    top = y + Math.round((height - overlayHeight) * (overlayConfig.customY / 100));
+  }
+  overlayWindow.setBounds({ x: left, y: top, width: OVERLAY_WIDTH, height: overlayHeight });
+}
+
+function createOverlayWindow() {
+  if (overlayWindow) return;
+  overlayWindow = new BrowserWindow({
+    width: OVERLAY_WIDTH,
+    height: OVERLAY_CARD_HEIGHT,
+    show: false,
+    frame: false,
+    transparent: true,
+    resizable: false,
+    minimizable: false,
+    maximizable: false,
+    focusable: false,
+    skipTaskbar: true,
+    hasShadow: false,
+    backgroundColor: '#00000000',
+    webPreferences: {
+      preload: path.join(__dirname, 'overlay-preload.cjs'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+    },
+  });
+  overlayWindow.setAlwaysOnTop(true, 'screen-saver');
+  overlayWindow.setIgnoreMouseEvents(true, { forward: true });
+  overlayWindow.on('closed', () => { overlayWindow = null; overlayReady = false; });
+  overlayWindow.webContents.on('did-finish-load', () => {
+    overlayReady = true;
+    pendingOverlay.forEach((notification) => overlayWindow.webContents.send('overlay:show', notification));
+    pendingOverlay = [];
+  });
+  overlayWindow.loadFile(path.join(__dirname, 'overlay.html'));
+}
+
+async function showPlaybackOverlay(payload = {}) {
+  if (!overlayConfig.enabled) return;
+  createOverlayWindow();
+  await positionOverlay();
+  const action = ['play', 'pause', 'seek', 'join', 'leave'].includes(payload.action) ? payload.action : 'pause';
+  const notification = {
+    name: String(payload.name || 'A viewer').slice(0, 32),
+    action,
+    position: Math.max(0, Number(payload.position) || 0),
+    duration: overlayConfig.duration,
+  };
+  if (overlayReady && overlayWindow && !overlayWindow.webContents.isDestroyed()) overlayWindow.webContents.send('overlay:show', notification);
+  else {
+    pendingOverlay.push(notification);
+    if (pendingOverlay.length > OVERLAY_MAX_ITEMS) pendingOverlay.shift();
+  }
+  overlayWindow.showInactive();
+}
+
+ipcMain.on('overlay:config', (_event, value) => {
+  overlayConfig = normalizedOverlayConfig(value);
+  if (!overlayConfig.enabled) overlayWindow?.hide();
+  else if (overlayWindow?.isVisible()) positionOverlay().catch(() => {});
+});
+ipcMain.on('overlay:resize', (_event, height) => {
+  const maxHeight = OVERLAY_MAX_ITEMS * OVERLAY_CARD_HEIGHT + (OVERLAY_MAX_ITEMS - 1) * OVERLAY_GAP;
+  overlayHeight = Math.max(OVERLAY_CARD_HEIGHT, Math.min(maxHeight, Number(height) || OVERLAY_CARD_HEIGHT));
+  if (overlayWindow) positionOverlay().catch(() => {});
+});
+ipcMain.on('overlay:show', (_event, payload) => { showPlaybackOverlay(payload).catch(() => {}); });
+ipcMain.on('overlay:hide', () => overlayWindow?.hide());
 
 function finishWindowClose() {
   if (!win || allowWindowClose) return;
   allowWindowClose = true;
   clearTimeout(closeFallbackTimer);
+  overlayWindow?.close();
   win.close();
 }
 
