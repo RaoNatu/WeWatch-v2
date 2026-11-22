@@ -32,6 +32,12 @@ service cloud.firestore {
           || (request.auth.uid == resource.data.hostUid
             && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['playbackControlsEnabled']))
           || (request.auth.uid == resource.data.hostUid
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['driftCorrection'])
+            && request.resource.data.driftCorrection.enabled is bool
+            && request.resource.data.driftCorrection.threshold is number
+            && request.resource.data.driftCorrection.threshold >= 2.5
+            && request.resource.data.driftCorrection.threshold <= 15)
+          || (request.auth.uid == resource.data.hostUid
             && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['pingRequest']))
           || (request.auth.uid == resource.data.hostUid
             && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['ping']))

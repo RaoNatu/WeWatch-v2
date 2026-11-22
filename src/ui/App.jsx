@@ -46,7 +46,7 @@ async function createRoom(uid, name, initialPlayback) {
         const current = await tx.get(ref);
         if (current.exists()) throw new Error('ROOM_COLLISION');
         const playback = { position: initialPlayback?.time || 0, duration: initialPlayback?.length || 0, movie: initialPlayback?.information?.category?.meta?.title || '', paused: true, updatedBy: uid, updatedAt: serverTimestamp() };
-        tx.set(ref, { hostUid: uid, memberUids: [uid], memberCount: 1, playbackControlsEnabled: true, createdAt: serverTimestamp(), playback });
+        tx.set(ref, { hostUid: uid, memberUids: [uid], memberCount: 1, playbackControlsEnabled: true, driftCorrection: { enabled: false, threshold: 2.5 }, createdAt: serverTimestamp(), playback });
         tx.set(memberRef(code, uid), { uid, name, joinedAt: serverTimestamp(), playback });
       });
       return code;
@@ -105,6 +105,7 @@ function App() {
   const [authReady, setAuthReady] = useState(false);
   const [name, setName] = useState(localStorage.getItem('wewatch-name') || '');
   const [greeting, setGreeting] = useState(movieGreeting);
+  const [driftThresholdDraft, setDriftThresholdDraft] = useState('2.5');
   const [preferences, setPreferences] = useState(readPreferences);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [codeInput, setCodeInput] = useState('');
@@ -138,6 +139,9 @@ function App() {
   const lastPingReplyRef = useRef('');
   const sessionLoggedRef = useRef(false);
   const lastManagedStatusRef = useRef(null);
+
+  const driftThreshold = Math.max(2.5, Math.min(15, Number(room?.driftCorrection?.threshold) || 2.5));
+  useEffect(() => { setDriftThresholdDraft(String(driftThreshold)); }, [driftThreshold]);
 
   useEffect(() => {
     const timer = setInterval(() => setGreeting(movieGreeting()), 60_000);
@@ -301,7 +305,8 @@ function App() {
     if (!remotePlayback || !code || !uid || remotePlayback.updatedBy === uid || !vlc.managed || applyingRemote.current) return;
     const initialRoomSync = initializedPlaybackRoomRef.current !== code;
     initializedPlaybackRoomRef.current = code;
-    const followHost = initialRoomSync || !room?.playbackControlsEnabled;
+    const autoDriftCorrection = room?.driftCorrection?.enabled === true;
+    const followHost = initialRoomSync || !room?.playbackControlsEnabled || autoDriftCorrection;
     if (!followHost) return;
     const apply = async () => {
       applyingRemote.current = true;
@@ -312,14 +317,14 @@ function App() {
           const target = (remotePlayback.position || 0) + (remotePlayback.paused ? 0 : age);
           const stateMismatch = remotePlayback.paused !== (state.state !== 'playing');
           if (followHost && stateMismatch) await window.desktop.control(remotePlayback.paused ? 'pause' : 'play');
-          const driftLimit = remotePlayback.paused && stateMismatch ? 0.8 : 1.5;
+          const driftLimit = !initialRoomSync && autoDriftCorrection ? driftThreshold : remotePlayback.paused && stateMismatch ? 0.8 : 1.5;
           if (followHost && Math.abs((state.time || 0) - target) > driftLimit) await window.desktop.control('seek', target);
         }
       } catch {}
       setTimeout(() => { applyingRemote.current = false; }, 1500);
     };
     apply();
-  }, [code, room?.playbackControlsEnabled, remotePlayback?.position, remotePlayback?.paused, remotePlayback?.updatedBy, localPlayback?.time, localPlayback?.state, vlc.managed, uid]);
+  }, [code, room?.playbackControlsEnabled, room?.driftCorrection?.enabled, driftThreshold, remotePlayback?.position, remotePlayback?.paused, remotePlayback?.updatedBy, localPlayback?.time, localPlayback?.state, vlc.managed, uid]);
 
   useEffect(() => {
     const command = room?.playbackCommand;
@@ -541,6 +546,25 @@ function App() {
     }
     catch (e) { setError(e.message); }
   };
+  const toggleDriftCorrection = async () => {
+    if (!isHost || !code) return;
+    const enabled = room?.driftCorrection?.enabled !== true;
+    try {
+      await updateDoc(roomRef(code), { driftCorrection: { enabled, threshold: driftThreshold } });
+      logEvent('Drift correction changed', name || 'You', `Automatic correction ${enabled ? 'enabled' : 'disabled'} · ${driftThreshold}s threshold`);
+    } catch (e) { setError(`Couldn't update drift correction: ${e.message}`); }
+  };
+  const saveDriftThreshold = async () => {
+    if (!isHost || !code) return;
+    const value = Number(driftThresholdDraft);
+    if (!Number.isFinite(value)) { setDriftThresholdDraft(String(driftThreshold)); return; }
+    const threshold = Math.max(2.5, Math.min(15, Math.round(value * 2) / 2));
+    try {
+      await updateDoc(roomRef(code), { driftCorrection: { enabled: room?.driftCorrection?.enabled === true, threshold } });
+      setDriftThresholdDraft(String(threshold));
+      logEvent('Drift threshold changed', name || 'You', `Correction starts at ${threshold}s of drift`);
+    } catch (e) { setError(`Couldn't save drift threshold: ${e.message}`); }
+  };
   const clearActivity = () => setEvents([]);
   const saveSettings = (next) => setPreferences((current) => ({ ...current, ...next }));
   const progress = localPlayback?.length ? Math.min(100, ((localPlayback.time || 0) / localPlayback.length) * 100) : 0;
@@ -572,7 +596,7 @@ function App() {
             <button className="secondary-btn" disabled={Boolean(busy) || codeInput.length !== 6} onClick={() => runRoomAction('join', codeInput)}><span>{busy === 'join' ? 'Finding your room…' : 'Join the room'}</span>{busy === 'join' ? <LoaderCircle className="spin" size={19} /> : <ArrowUpRight size={19} />}</button>
             <div className="secure-note"><ShieldCheck size={17} /> Your invite is your key</div>
           </article>
-        </div> : <RoomView code={code} uid={uid} members={members} peer={peer} name={name} room={room} isHost={isHost} peerPlayback={peerPlayback} pingMs={room?.ping?.ms} driftLabel={driftLabel} copyCode={copyCode} onLeave={leaveRoom} leaving={busy === 'leave'} onToggleControls={toggleMemberControls} onSyncHost={syncWithHost} onSyncMembers={syncMembersToHost} />}
+        </div> : <RoomView code={code} uid={uid} members={members} peer={peer} name={name} room={room} isHost={isHost} peerPlayback={peerPlayback} pingMs={room?.ping?.ms} driftLabel={driftLabel} driftThreshold={driftThreshold} driftThresholdDraft={driftThresholdDraft} onDriftThresholdChange={setDriftThresholdDraft} onSaveDriftThreshold={saveDriftThreshold} onToggleDriftCorrection={toggleDriftCorrection} copyCode={copyCode} onLeave={leaveRoom} leaving={busy === 'leave'} onToggleControls={toggleMemberControls} onSyncHost={syncWithHost} onSyncMembers={syncMembersToHost} />}
 
         <section className="setup-section">
           <div className="section-title"><div><span className="section-kicker">THE PROJECTOR BOOTH</span><h2>Your local player</h2></div><div className={`vlc-pill ${vlc.managed ? 'connected' : vlc.installed ? 'available' : 'missing'}`}><span />{statusLabel}</div></div>
@@ -598,18 +622,26 @@ function App() {
   </main>;
 }
 
-function RoomView({ code, uid, members, peer, name, room, isHost, peerPlayback, pingMs, driftLabel, copyCode, onLeave, leaving, onToggleControls, onSyncHost, onSyncMembers }) {
+function RoomView({ code, uid, members, peer, name, room, isHost, peerPlayback, pingMs, driftLabel, driftThreshold, driftThresholdDraft, onDriftThresholdChange, onSaveDriftThreshold, onToggleDriftCorrection, copyCode, onLeave, leaving, onToggleControls, onSyncHost, onSyncMembers }) {
   const host = members.find((member) => member.uid === room?.hostUid);
   const participants = [...members];
   if (!participants.some((member) => member.uid === uid)) participants.unshift({ uid, name });
   const memberOrder = new Map((room?.memberUids || []).map((memberUid, index) => [memberUid, index]));
   participants.sort((a, b) => (memberOrder.get(a.uid) ?? Number.MAX_SAFE_INTEGER) - (memberOrder.get(b.uid) ?? Number.MAX_SAFE_INTEGER));
   const formatPosition = (playback) => playback ? `${fmt(playback.position || 0)} / ${fmt(playback.duration || 0)}` : 'No movie playing';
+  const thresholdDirty = Number(driftThresholdDraft) !== driftThreshold;
   return <section className="active-room panel"><div className="room-live"><div><div className="section-kicker">YOUR PRIVATE ROOM · {members.length || 1}/6 WATCHING</div><h2>You're in. <em>Invite your people.</em></h2></div><button className="leave-btn" disabled={leaving} onClick={onLeave}><X size={18} /> {leaving ? (isHost ? 'Closing room…' : 'Leaving room…') : (isHost ? 'Close room for everyone' : 'Leave room')}</button></div><div className="room-invite"><div><span>SHARE THIS SIX-DIGIT ROOM CODE</span><strong>{code.slice(0, 3)} <b>{code.slice(3)}</b></strong></div><button className="copy-btn" onClick={copyCode}><Copy size={18} /> Copy invite code</button></div>
     <div className="current-user-banner"><span className="avatar current-user-avatar">{name.trim().slice(0, 1).toUpperCase() || 'Y'}</span><div><small>YOU'RE WATCHING AS</small><b>{name || 'Your profile'}</b></div><span className="current-user-role">{isHost ? 'HOST' : 'MEMBER'} · YOU</span></div>
     <div className="room-members">{participants.map((member) => { const isCurrentUser = member.uid === uid; const memberIsHost = member.uid === room?.hostUid; return <div className={`room-member ${isCurrentUser ? 'current-user-row' : ''}`} key={member.uid}><span className={`avatar ${isCurrentUser ? '' : 'friend'}`}>{member.name?.slice(0, 1).toUpperCase() || '＋'}</span><div><b>{member.name || (isCurrentUser ? 'You' : 'Guest')}</b><small>{memberIsHost ? 'HOST' : 'MEMBER'}{isCurrentUser ? ' · YOU' : ''}{member.playback?.paused === false ? ' · PLAYING' : ''}</small><small className="member-title"><Film size={11} /> {member.playback?.movie || 'Movie not selected'}</small><small className="member-movie">{formatPosition(member.playback)}</small></div><span className="member-ready"><Check size={12} /> {isCurrentUser ? 'YOU' : 'HERE'}</span></div>; })}</div>
-    <div className="room-controls"><div className="room-control-info"><span className="ping-tag"><Gauge size={14} /> {pingMs ? `${pingMs} ms relay ping` : 'Measuring room ping…'}</span><span className={`drift-tag ${driftLabel === 'In sync' ? 'good' : ''}`}>{driftLabel}</span></div>{isHost ? <><button className="sync-host-btn" onClick={onSyncMembers}><RefreshCw size={15} /> Sync members to host</button><button className={`control-toggle ${room?.playbackControlsEnabled ? 'enabled' : ''}`} onClick={onToggleControls}><span className="toggle-switch"><i /></span> Member playback controls <b>{room?.playbackControlsEnabled ? 'ON' : 'OFF'}</b></button></> : <button className="sync-host-btn" onClick={onSyncHost}><RefreshCw size={15} /> Sync with host</button>}</div>
-    <div className="room-hint"><LockKeyhole size={14} /> {isHost ? 'You are the host. Choose whether your guest can control playback.' : `The host is ${host?.name || 'your friend'}. ${room?.playbackControlsEnabled ? 'You can control playback.' : 'Playback controls are managed by the host.'}`}</div></section>;
+    <div className="room-controls">
+      <div className="room-control-info"><span className="ping-tag"><Gauge size={14} /> {pingMs ? `${pingMs} ms relay ping` : 'Measuring room ping…'}</span><span className={`drift-tag ${driftLabel === 'In sync' ? 'good' : ''}`}>{driftLabel}</span></div>
+      {isHost ? <div className="room-host-controls">
+        <div className="room-setting-row"><div className="room-setting-copy"><b>Automatic drift correction</b><small>Follow your playback when a member drifts past the chosen threshold.</small></div><button className={`control-toggle ${room?.driftCorrection?.enabled ? 'enabled' : ''}`} aria-pressed={room?.driftCorrection?.enabled === true} onClick={onToggleDriftCorrection}><span className="toggle-switch"><i /></span> <b>{room?.driftCorrection?.enabled ? 'ON' : 'OFF'}</b></button></div>
+        {room?.driftCorrection?.enabled && <div className="room-setting-row"><label className="room-setting-copy" htmlFor="drift-threshold"><b>Correction threshold</b><small>Members are corrected once drift exceeds this value.</small></label><div className="threshold-input"><input id="drift-threshold" type="number" min="2.5" max="15" step="0.5" value={driftThresholdDraft} onChange={(event) => onDriftThresholdChange(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') onSaveDriftThreshold(); }} aria-label="Automatic drift correction threshold in seconds" /><span>sec</span><button className="threshold-save" disabled={!thresholdDirty || !Number.isFinite(Number(driftThresholdDraft))} onClick={onSaveDriftThreshold}>Save</button></div></div>}
+        <div className="room-host-actions"><button className="sync-host-btn" onClick={onSyncMembers}><RefreshCw size={15} /> Sync members to host</button><button className={`control-toggle ${room?.playbackControlsEnabled ? 'enabled' : ''}`} onClick={onToggleControls}><span className="toggle-switch"><i /></span> Member playback controls <b>{room?.playbackControlsEnabled ? 'ON' : 'OFF'}</b></button></div>
+      </div> : <button className="sync-host-btn" onClick={onSyncHost}><RefreshCw size={15} /> Sync with host</button>}
+    </div>
+    <div className="room-hint"><LockKeyhole size={14} /> {isHost ? `Automatic drift correction is ${room?.driftCorrection?.enabled ? `on at ${driftThreshold}s` : 'off'}. Choose whether your guest can control playback.` : `The host is ${host?.name || 'your friend'}. ${room?.playbackControlsEnabled ? 'You can control playback.' : 'Playback controls are managed by the host.'} ${room?.driftCorrection?.enabled ? `Automatic correction is on at ${driftThreshold}s.` : ''}`}</div></section>;
 }
 
 function SettingsPanel({ name, preferences, onNameChange, onChange, onClose }) {
