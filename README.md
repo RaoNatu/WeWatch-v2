@@ -45,6 +45,8 @@ In Firebase Console for the configured project, enable **Authentication → Anon
 
 We Watch starts VLC with its HTTP control interface bound to `127.0.0.1` on a random port and a random password held by Electron's main process. It sends playback updates through Firestore. Rooms support up to six people. The host can transfer host duties, remove a member, lock the room to prevent new joins, sync all members to the host, and turn member playback controls on or off. Guests can leave without closing the room. Closing We Watch shuts down VLC processes it started.
 
+If VLC is installed in a custom location, select its executable under **Settings → VLC player → Browse**. We Watch remembers that path on the device.
+
 The host can enable automatic drift correction and choose a threshold from 2.5 to 15 seconds. Members can also sync with the host on demand. Everyone needs the same movie file locally; We Watch does not transfer movie files, subtitles, or VLC installations. Playback is best-effort synchronization, so network delay and VLC seek behavior can cause small offsets. The room ping measures a Firebase relay round trip rather than a direct device-to-device connection.
 
 Room chat and quick reactions let members communicate while watching. The optional VLC overlay can show playback updates, room activity, chat messages, and reactions. In Settings, each overlay type can be enabled separately, along with the master toggle, position, and display duration. The app's event log is local to the device and retains the latest 80 entries. Recently Played keeps the latest video title and its last playback position (`HH:MM:SS`) on that device. Profile name and appearance settings are also saved locally.

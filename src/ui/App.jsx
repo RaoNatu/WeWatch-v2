@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { signInAnonymously, onAuthStateChanged } from 'firebase/auth';
 import { addDoc, collection, doc, limitToLast, onSnapshot, orderBy, query, runTransaction, serverTimestamp, updateDoc } from 'firebase/firestore';
-import { Activity, ArrowDownLeft, ArrowUpRight, Captions, Check, CircleHelp, Copy, Film, Gauge, Headphones, LayoutDashboard, Link2, LoaderCircle, LockKeyhole, Pause, Play, Plus, Radio, RefreshCw, Settings2, ShieldCheck, SlidersHorizontal, Type, Users, Wifi, X } from 'lucide-react';
+import { Activity, ArrowDownLeft, ArrowUpRight, Captions, Check, CircleHelp, Copy, Film, FolderOpen, Gauge, Headphones, LayoutDashboard, Link2, LoaderCircle, LockKeyhole, Pause, Play, Plus, Radio, RefreshCw, Settings2, ShieldCheck, SlidersHorizontal, Type, Users, Wifi, X } from 'lucide-react';
 import { auth, db } from '../firebase';
 
+const logoUrl = `${import.meta.env.BASE_URL}we-watch.png`;
 const fmt = (seconds = 0) => `${Math.floor(seconds / 60).toString().padStart(2, '0')}:${Math.floor(seconds % 60).toString().padStart(2, '0')}`;
 const clockFmt = (seconds = 0) => {
   const value = Math.max(0, Math.floor(Number(seconds) || 0));
@@ -759,7 +760,7 @@ function App() {
 
   return <main className="app-shell">
     <header className="topbar">
-      <a className="brand" href="#home" aria-label="We Watch home"><img className="brand-logo" src="/we-watch.png" alt="" /><span className="brand-word">We Watch</span><span className="brand-beta">WATCH CLUB</span></a>
+      <a className="brand" href="#home" aria-label="We Watch home"><img className="brand-logo" src={logoUrl} alt="" /><span className="brand-word">We Watch</span><span className="brand-beta">WATCH CLUB</span></a>
       <div className="top-center"><span className="live-dot" /> YOUR PRIVATE LITTLE CINEMA</div>
       <div className="top-actions"><span className="your-name">{name || 'Your profile'}</span><button className="icon-btn" aria-label="Settings" onClick={() => setSettingsOpen(true)}><Settings2 size={20} /><span>Settings</span></button></div>
     </header>
@@ -804,7 +805,7 @@ function App() {
       </aside>
     </div>
     <div className="window-footer"><span><Activity size={15} /> {authReady ? 'Connected to the watch club' : 'Connecting to the watch club'}</span><span>WE WATCH DESKTOP <i>·</i> 0.1.0 <i>·</i> Made with ❤️ by Natu</span></div>
-    {settingsOpen && <SettingsPanel name={name} preferences={preferences} onNameChange={setName} onChange={saveSettings} onClose={async () => { localStorage.setItem('wewatch-name', name.trim()); if (code && uid) updateDoc(memberRef(code, uid), { name: name.trim() }).catch(() => {}); setSettingsOpen(false); }} />}
+    {settingsOpen && <SettingsPanel name={name} preferences={preferences} vlcPath={vlc.binary} onNameChange={setName} onChange={saveSettings} onSelectVlc={async () => { const selected = await window.desktop.chooseVlcExecutable(); if (selected) await refreshVlc(); return selected; }} onClose={async () => { localStorage.setItem('wewatch-name', name.trim()); if (code && uid) updateDoc(memberRef(code, uid), { name: name.trim() }).catch(() => {}); setSettingsOpen(false); }} />}
     {toast && <div className="toast"><Check size={18} />{toast}</div>}
   </main>;
 }
@@ -857,10 +858,13 @@ function RoomView({ code, uid, members, messages, onSendRoomMessage, peer, name,
     </section></section>;
 }
 
-function SettingsPanel({ name, preferences, onNameChange, onChange, onClose }) {
+function SettingsPanel({ name, preferences, vlcPath, onNameChange, onChange, onSelectVlc, onClose }) {
+  const [vlcPickerError, setVlcPickerError] = useState('');
+  const [vlcPickerBusy, setVlcPickerBusy] = useState(false);
   const swatches = ['#bc4b32', '#355c4d', '#416b86', '#7d5a83', '#bd6670', '#cf8b3d'];
   return <div className="settings-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className="settings-panel" role="dialog" aria-modal="true" aria-labelledby="settings-title"><div className="settings-head"><div className="settings-heading-icon"><SlidersHorizontal size={21} /></div><div><span className="section-kicker">YOUR WATCH SPACE</span><h2 id="settings-title">Settings</h2></div><button className="settings-close" onClick={onClose} aria-label="Close settings"><X size={20} /></button></div>
     <div className="setting-group"><label className="setting-label"><Users size={15} /> Profile</label><div className="setting-row"><div><b>Display name</b><small>This is how you appear in rooms.</small></div><input className="settings-name" maxLength={24} value={name} onChange={(event) => onNameChange(event.target.value)} placeholder="Your name" /></div></div>
+    <div className="setting-group"><label className="setting-label"><Film size={16} /> VLC player</label><div className="setting-row"><div><b>VLC executable</b><small>{vlcPath ? 'We Watch will use this VLC installation.' : 'Choose VLC manually if it is installed in a custom location.'}</small></div><div className="vlc-path-control"><span title={vlcPath || 'No custom VLC path selected'}>{vlcPath || 'Automatic detection'}</span><button className="vlc-select" disabled={vlcPickerBusy} onClick={async () => { setVlcPickerError(''); setVlcPickerBusy(true); try { await onSelectVlc(); } catch (error) { setVlcPickerError(error.message || 'Could not select VLC.'); } finally { setVlcPickerBusy(false); } }}><FolderOpen size={15} />{vlcPickerBusy ? 'Checking…' : 'Browse'}</button></div></div>{vlcPickerError && <p className="vlc-picker-error" role="alert">{vlcPickerError}</p>}</div>
     <div className="setting-group"><label className="setting-label"><Type size={17} /> Appearance</label><div className="font-samples" aria-label="Typography samples"><div className="font-sample-display"><small>HEADLINES · PLAYFAIR DISPLAY</small><span>Movie night, together.</span></div><div className="font-sample-reading"><small>READING · DM SANS</small><span>Settle in. Your movie is ready.</span></div><div className="font-sample-utility"><small>DETAILS · DM MONO</small><span>ROOM CODE  123 456</span></div></div><div className="setting-row"><div><b>Text size</b><small>Scale text and interface icons from 90% to 200%.</small></div><div className="size-control"><span>A</span><input aria-label="Text size" type="range" min="0.9" max="2" step="0.05" value={preferences.fontScale} onChange={(event) => onChange({ fontScale: Number(event.target.value) })} /><strong>A</strong><em>{Math.round(preferences.fontScale * 100)}%</em></div></div>
     <div className="setting-row"><div><b>Layout spacing</b><small>Choose how much room the panels get.</small></div><div className="layout-options">{['compact', 'comfortable', 'spacious'].map((layout) => <button key={layout} className={preferences.layout === layout ? 'selected' : ''} onClick={() => onChange({ layout })}><LayoutDashboard size={14} />{layout}</button>)}</div></div>
     <div className="setting-row"><div><b>Accent color</b><small>Personalize your We Watch highlights.</small></div><div className="color-options">{swatches.map((color) => <button key={color} style={{ '--swatch': color }} className={preferences.accent.toLowerCase() === color ? 'selected' : ''} onClick={() => onChange({ accent: color })} aria-label={`Use ${color}`} />)}<label className="custom-color" title="Choose a custom color"><input type="color" value={preferences.accent} onChange={(event) => onChange({ accent: event.target.value })} /><Plus size={15} /></label></div></div></div>

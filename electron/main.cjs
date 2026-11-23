@@ -1,4 +1,5 @@
 const { app, BrowserWindow, dialog, ipcMain, screen } = require('electron');
+const fs = require('node:fs/promises');
 const { spawn, execFile } = require('node:child_process');
 const { promisify } = require('node:util');
 const path = require('node:path');
@@ -200,7 +201,7 @@ function createWindow() {
     minWidth: 1080,
     minHeight: 720,
     title: 'We Watch',
-    icon: path.join(__dirname, '../public/we-watch.png'),
+    icon: path.join(__dirname, '../public', process.platform === 'win32' ? 'we-watch.ico' : 'we-watch.png'),
     backgroundColor: '#111210',
     ...(process.platform === 'win32' ? { titleBarStyle: 'hidden', titleBarOverlay: { color: '#111210', symbolColor: '#d9e0d1', height: 36 } } : {}),
     webPreferences: {
@@ -237,11 +238,28 @@ ipcMain.on('app:close-cleanup-done', finishWindowClose);
 async function findVlc() {
   if (vlcLookupDone) return vlcBinary;
   vlcLookupDone = true;
-  const candidates = process.platform === 'win32'
-    ? ['C:\\Program Files\\VideoLAN\\VLC\\vlc.exe', 'C:\\Program Files (x86)\\VideoLAN\\VLC\\vlc.exe']
-    : ['/usr/bin/vlc', '/usr/local/bin/vlc', '/snap/bin/vlc'];
+  let preferredPath = '';
+  try {
+    const configPath = path.join(app.getPath('userData'), 'vlc-path.json');
+    const config = JSON.parse(await fs.readFile(configPath, 'utf8'));
+    preferredPath = typeof config.path === 'string' ? config.path.trim() : '';
+  } catch {}
+  const candidates = [
+    preferredPath,
+    ...(process.platform === 'win32'
+      ? [
+        process.env.VLC_PATH,
+        process.env.VLC_HOME && path.join(process.env.VLC_HOME, 'vlc.exe'),
+        process.env.ProgramFiles && path.join(process.env.ProgramFiles, 'VideoLAN', 'VLC', 'vlc.exe'),
+        process.env['ProgramFiles(x86)'] && path.join(process.env['ProgramFiles(x86)'], 'VideoLAN', 'VLC', 'vlc.exe'),
+        process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'Programs', 'VideoLAN', 'VLC', 'vlc.exe'),
+        'C:\\Program Files\\VideoLAN\\VLC\\vlc.exe',
+        'C:\\Program Files (x86)\\VideoLAN\\VLC\\vlc.exe',
+      ]
+      : ['/usr/bin/vlc', '/usr/local/bin/vlc', '/snap/bin/vlc']),
+  ].filter(Boolean);
   for (const candidate of candidates) {
-    try { await execFileAsync(candidate, ['--version'], { timeout: 2000, windowsHide: true }); vlcBinary = candidate; return candidate; } catch {}
+    try { await execFileAsync(candidate, ['--version'], { timeout: 5000, windowsHide: true }); vlcBinary = candidate; return candidate; } catch {}
   }
   try {
     const { stdout } = await execFileAsync(process.platform === 'win32' ? 'where.exe' : 'which', ['vlc'], { timeout: 2000, windowsHide: true });
@@ -308,7 +326,30 @@ async function vlcCommand(command, value) {
   return response.json();
 }
 
-ipcMain.handle('vlc:status', async () => ({ installed: Boolean(vlcBinary || await findVlc()), running: await processRunning(), managed: Boolean(vlcProcess && vlcProcess.exitCode === null) }));
+ipcMain.handle('vlc:status', async () => {
+  const binary = vlcBinary || await findVlc();
+  return { installed: Boolean(binary), binary: binary || '', running: await processRunning(), managed: Boolean(vlcProcess && vlcProcess.exitCode === null) };
+});
+ipcMain.handle('vlc:pick-executable', async () => {
+  const result = await dialog.showOpenDialog(win, {
+    title: 'Select VLC executable',
+    properties: ['openFile'],
+    ...(process.platform === 'win32' ? { filters: [{ name: 'VLC executable', extensions: ['exe'] }] } : {}),
+  });
+  if (result.canceled || !result.filePaths[0]) return null;
+  const selected = result.filePaths[0];
+  try {
+    await execFileAsync(selected, ['--version'], { timeout: 5000, windowsHide: true });
+  } catch {
+    throw new Error('That file could not be started as VLC. Select the VLC executable (vlc.exe on Windows).');
+  }
+  const configPath = path.join(app.getPath('userData'), 'vlc-path.json');
+  await fs.mkdir(path.dirname(configPath), { recursive: true });
+  await fs.writeFile(configPath, JSON.stringify({ path: selected }), 'utf8');
+  vlcBinary = selected;
+  vlcLookupDone = true;
+  return selected;
+});
 ipcMain.handle('vlc:start', async () => launchVlc());
 ipcMain.handle('vlc:pick-media', async () => {
   const result = await dialog.showOpenDialog(win, { title: 'Choose a movie', properties: ['openFile'], filters: [{ name: 'Video', extensions: ['mp4', 'mkv', 'avi', 'mov', 'webm', 'm4v', 'mpeg', 'mpg'] }, { name: 'All files', extensions: ['*'] }] });

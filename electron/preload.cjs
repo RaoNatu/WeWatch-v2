@@ -2,6 +2,7 @@ const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('desktop', {
   status: () => ipcRenderer.invoke('vlc:status'),
+  chooseVlcExecutable: () => ipcRenderer.invoke('vlc:pick-executable'),
   startVlc: () => ipcRenderer.invoke('vlc:start'),
   chooseMovie: () => ipcRenderer.invoke('vlc:pick-media'),
   control: (action, seconds) => ipcRenderer.invoke('vlc:control', { action, seconds }),
